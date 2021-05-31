@@ -1,0 +1,17 @@
+###########################################
+# Syntax Coloring Map For CommunicationBus library
+###########################################
+
+###########################################
+# Datatypes (KEYWORD1)
+###########################################
+
+Mallet	KEYWORD1
+
+###########################################
+# Methods and Functions (KEYWORD2)
+###########################################
+
+updateMallet	KEYWORD2
+triggerMallet	KEYWORD2
+isIdle			KEYWORD2
