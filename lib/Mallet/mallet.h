@@ -23,6 +23,8 @@ class Mallet{
   void delayedTrigger(unsigned long delayTime);
   bool isIdle();
   void setDelay(unsigned long lagTime);
+  int getMidiPitch();
+  void setMidiPitch(int pitch);
   unsigned long getDelay();
   
   enum State {

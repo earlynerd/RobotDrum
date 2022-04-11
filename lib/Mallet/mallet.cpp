@@ -107,6 +107,16 @@ void Mallet::handleQueuedStrikes()
   }
 }
 
+void Mallet::setMidiPitch(int pitch)
+{
+  MIDInote = pitch;
+}
+
+int Mallet::getMidiPitch()
+{
+  return MIDInote;
+}
+
 unsigned long Mallet::getDelay(){
   return lag;
 }
