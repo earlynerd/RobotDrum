@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "driver/i2s.h"
+#include "driver/gpio.h"
 #include "soc/i2s_reg.h"
 
 #include "I2SMEMSSampler.h"
@@ -20,6 +21,10 @@ void I2SMEMSSampler::configureI2S()
     }
 
     i2s_set_pin(getI2SPort(), &m_i2sPins);
+
+    // For single-mic setups the inactive I2S slot is tri-stated. Bias DIN low
+    // so the receiver does not float on the inactive half-frame.
+    gpio_set_pull_mode(static_cast<gpio_num_t>(m_i2sPins.data_in_num), GPIO_PULLDOWN_ONLY);
 }
 
 void I2SMEMSSampler::processI2SData(uint8_t *i2sData, size_t bytesRead)

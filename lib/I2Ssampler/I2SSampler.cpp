@@ -31,16 +31,40 @@ void i2sReaderTask(void *param)
         {
             if (evt.type == I2S_EVENT_RX_DONE)
             {
-                size_t bytesRead = 0;
-                do
+                // Read only the bytes associated with this event so we return
+                // to queue processing promptly and avoid RX queue overflow.
+                size_t remaining = evt.size;
+                if (remaining == 0)
                 {
-                    // read data from the I2S peripheral
+                    remaining = 1024;
+                }
+
+                while (remaining > 0)
+                {
                     uint8_t i2sData[1024];
-                    // read from i2s
-                    i2s_read(sampler->getI2SPort(), i2sData, 1024, &bytesRead, 10);
-                    // process the raw data
+                    size_t request = (remaining > sizeof(i2sData)) ? sizeof(i2sData) : remaining;
+                    size_t bytesRead = 0;
+                    i2s_read(sampler->getI2SPort(), i2sData, request, &bytesRead, portMAX_DELAY);
+                    if (bytesRead == 0)
+                    {
+                        break;
+                    }
+
                     sampler->processI2SData(i2sData, bytesRead);
-                } while (bytesRead > 0);
+
+                    if (bytesRead >= remaining)
+                    {
+                        break;
+                    }
+                    remaining -= bytesRead;
+                }
+            }
+            else if (evt.type == I2S_EVENT_RX_Q_OVF)
+            {
+                // Drain a small chunk to help the peripheral recover.
+                uint8_t discard[256];
+                size_t bytesRead = 0;
+                i2s_read(sampler->getI2SPort(), discard, sizeof(discard), &bytesRead, 0);
             }
         }
     }
@@ -60,7 +84,7 @@ void I2SSampler::start(i2s_port_t i2sPort, i2s_config_t &i2sConfig, int32_t buff
 
     m_writerTaskHandle = writerTaskHandle;
     //install and start i2s driver
-    i2s_driver_install(m_i2sPort, &i2sConfig, 4, &m_i2sQueue);
+    i2s_driver_install(m_i2sPort, &i2sConfig, 16, &m_i2sQueue);
     // set up the I2S configuration from the subclass
     configureI2S();
     // start a task to read samples from the ADC
