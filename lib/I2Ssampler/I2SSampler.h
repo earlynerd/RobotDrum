@@ -19,6 +19,8 @@ private:
     int32_t *m_currentAudioBuffer;
     // buffer containing samples that have been captured already
     int32_t *m_capturedAudioBuffer;
+    // true while the writer task has not yet consumed the captured buffer
+    volatile bool m_bufferPending = false;
     // size of the audio buffers in bytes
     int32_t m_bufferSizeInBytes;
     // size of the audio buffer in samples
@@ -49,6 +51,10 @@ public:
     int32_t *getCapturedAudioBuffer()
     {
         return m_capturedAudioBuffer;
+    }
+    void bufferProcessed()
+    {
+        m_bufferPending = false;
     }
     void start(i2s_port_t i2sPort, i2s_config_t &i2sConfig, int32_t bufferSizeInSamples, TaskHandle_t writerTaskHandle);
 

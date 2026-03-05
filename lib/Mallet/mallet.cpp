@@ -24,6 +24,10 @@ Mallet::Mallet(int pin, int MIDIpitch, int malletChannel, int strikePWM, int str
   malletPin = pin;
   MIDInote = MIDIpitch;
   channel = malletChannel;
+}
+
+void Mallet::begin()
+{
   ledcAttachPin(malletPin, channel);
   ledcSetup(channel, 18000, 10);
 }
@@ -35,7 +39,6 @@ void Mallet::updateMallet()
   switch (malletState)
   {
   case IDLESTATE:
-    ledcWrite(channel, 0);
     break;
 
   case TRIGGER:
@@ -59,12 +62,14 @@ void Mallet::updateMallet()
     ledcWrite(channel, reboundPower);
     if (millis() >= (triggerTime + strikeDuration + coastDuration + reboundDuration))
     {
+      ledcWrite(channel, 0);
       lastCycleEndMillis = millis();
       malletState = IDLESTATE;
     }
     break;
 
   default:
+    ledcWrite(channel, 0);
     malletState = IDLESTATE;
     break;
   }
@@ -95,12 +100,14 @@ void Mallet::setRetriggerGap(unsigned long gapMs)
 
 void Mallet::abortAndClearQueue()
 {
+  portENTER_CRITICAL(&queueMux);
   for (uint16_t i = 0; i < StrikeQueueDepth; ++i)
   {
     delayedStrikeTriggerTimes[i] = 0;
     delayedStrikeHasProfile[i] = false;
   }
   queuedStrikeCount = 0;
+  portEXIT_CRITICAL(&queueMux);
   malletState = IDLESTATE;
   triggerTime = millis();
   lastCycleEndMillis = triggerTime;
@@ -123,7 +130,12 @@ void Mallet::delayedTrigger(unsigned long delayTime)
 
 void Mallet::delayedTrigger(unsigned long delayTime, const StrikeProfile &profile)
 {
-  if (queuedStrikeCount >= StrikeQueueDepth) return; //too many queued, ignore this one.
+  portENTER_CRITICAL(&queueMux);
+  if (queuedStrikeCount >= StrikeQueueDepth)
+  {
+    portEXIT_CRITICAL(&queueMux);
+    return;
+  }
 
   for (uint16_t k = 0; k < StrikeQueueDepth; k++)
   {
@@ -133,27 +145,33 @@ void Mallet::delayedTrigger(unsigned long delayTime, const StrikeProfile &profil
       delayedStrikeProfiles[k] = profile;
       delayedStrikeHasProfile[k] = true;
       queuedStrikeCount++;
+      portEXIT_CRITICAL(&queueMux);
       return;
     }
   }
+  portEXIT_CRITICAL(&queueMux);
 }
 
 //check if any queued strikes should be triggered. do so, and remove from buffer
 void Mallet::handleQueuedStrikes()
 {
+  portENTER_CRITICAL(&queueMux);
   if (queuedStrikeCount == 0)
   {
+    portEXIT_CRITICAL(&queueMux);
     return;
   }
 
   if (malletState != IDLESTATE)
   {
+    portEXIT_CRITICAL(&queueMux);
     return;
   }
 
   const unsigned long now = millis();
   if ((now - lastCycleEndMillis) < minRetriggerGapMs)
   {
+    portEXIT_CRITICAL(&queueMux);
     return;
   }
 
@@ -175,6 +193,7 @@ void Mallet::handleQueuedStrikes()
 
   if (candidate < 0)
   {
+    portEXIT_CRITICAL(&queueMux);
     return;
   }
 
@@ -196,6 +215,7 @@ void Mallet::handleQueuedStrikes()
   {
     queuedStrikeCount -= 1;
   }
+  portEXIT_CRITICAL(&queueMux);
 }
 
 void Mallet::setMidiPitch(int pitch)

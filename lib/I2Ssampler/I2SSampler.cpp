@@ -11,10 +11,16 @@ void I2SSampler::addSample(int32_t sample)
     // have we filled the buffer with data?
     if (m_audioBufferPos == m_bufferSizeInSamples)
     {
-        // swap to the other buffer
-        std::swap(m_currentAudioBuffer, m_capturedAudioBuffer);
         // reset the buffer position
         m_audioBufferPos = 0;
+        // skip swap if the writer hasn't consumed the previous buffer yet
+        if (m_bufferPending)
+        {
+            return;
+        }
+        // swap to the other buffer
+        std::swap(m_currentAudioBuffer, m_capturedAudioBuffer);
+        m_bufferPending = true;
         // tell the writer task to save the data
         xTaskNotify(m_writerTaskHandle, 1, eIncrement);
     }
@@ -79,12 +85,23 @@ void I2SSampler::start(i2s_port_t i2sPort, i2s_config_t &i2sConfig, int32_t buff
     m_audioBuffer1 = (int32_t *)malloc(bufferSizeInBytes);
     m_audioBuffer2 = (int32_t *)malloc(bufferSizeInBytes);
 
+    if (m_audioBuffer1 == nullptr || m_audioBuffer2 == nullptr)
+    {
+        Serial.println("FATAL: failed to allocate I2S audio buffers");
+        while (true) { delay(1000); }
+    }
+
     m_currentAudioBuffer = m_audioBuffer1;
     m_capturedAudioBuffer = m_audioBuffer2;
 
-    m_writerTaskHandle = writerTaskHandle;
     //install and start i2s driver
-    i2s_driver_install(m_i2sPort, &i2sConfig, 16, &m_i2sQueue);
+    esp_err_t err = i2s_driver_install(m_i2sPort, &i2sConfig, 16, &m_i2sQueue);
+    if (err != ESP_OK)
+    {
+        Serial.print("FATAL: i2s_driver_install failed: ");
+        Serial.println(err);
+        while (true) { delay(1000); }
+    }
     // set up the I2S configuration from the subclass
     configureI2S();
     // start a task to read samples from the ADC

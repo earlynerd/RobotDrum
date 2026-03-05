@@ -34,6 +34,8 @@ constexpr int kFftLength = 4096;
 constexpr int kCalibrationRepeats = 3;
 constexpr float kMicEmaAlpha = 0.01f;
 constexpr float kMicDcAlpha = 0.001f;
+constexpr uint16_t kMicEmaAlphaFixed = static_cast<uint16_t>(kMicEmaAlpha * 65536.0f);
+constexpr uint16_t kMicDcAlphaFixed = static_cast<uint16_t>(kMicDcAlpha * 65536.0f);
 constexpr int kMicSlotTo24BitShiftBits = 8;
 constexpr int kMicEffectiveBits = 24;
 constexpr int kMicUnusedLowBits = 24 - kMicEffectiveBits;
@@ -65,6 +67,7 @@ constexpr float kFftMinFundamentalToHarmonicRatio = 0.35f;
 constexpr float kFftWeakFundamentalPenalty = 6.0f;
 constexpr float kFftSecondWindowRelativeMagnitudeFloor = 0.60f;
 constexpr float kStereoSlotDominanceRatio = 2.0f;
+constexpr int32_t kStereoSlotDominanceRatioInt = 2;
 constexpr float kAutocorrMinDetectHz = 95.0f;
 constexpr float kAutocorrMaxDetectHz = 900.0f;
 constexpr float kAutocorrMinCorrelation = 0.20f;
@@ -132,6 +135,8 @@ volatile int gMicSampleMode = MIC_SAMPLE_MODE_AUTO;
 volatile bool gUsingStereoSamplePairs = true;
 volatile int gMicGainShiftBits = kMicGainShiftDefaultBits;
 volatile bool gCalibrationInProgress = false;
+uint32_t gStereoDetectBlockCount = 0;
+constexpr uint32_t kStereoDetectInterval = 64;
 
 volatile bool gFftCaptureArmed = false;
 volatile bool gFftFrameReady = false;
@@ -148,6 +153,7 @@ float gFftInput[kFftLength];
 float gFftOutput[kFftLength];
 float gFftWindow[kFftLength];
 bool gFftWindowReady = false;
+fft_config_t *gFftPlan = nullptr;
 
 i2s_config_t gI2sConfig = {
     .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -188,9 +194,8 @@ float lerp(float a, float b, float t)
   return a + ((b - a) * t);
 }
 
-int32_t emaFilter(int32_t input, int32_t average, float alpha)
+int32_t emaFilter(int32_t input, int32_t average, uint16_t integerAlpha)
 {
-  const uint16_t integerAlpha = static_cast<uint16_t>(alpha * 65536.0f);
   const int64_t blended = (static_cast<int64_t>(input) * integerAlpha) +
                           (static_cast<int64_t>(average) * (65536 - integerAlpha));
   return static_cast<int32_t>((blended + 32768) / 65536);
@@ -225,7 +230,7 @@ void serviceDelay(unsigned long delayMs)
 void updateMicrophoneEnvelope(int32_t sample)
 {
   const int32_t absSample = (sample >= 0) ? sample : -sample;
-  gFilteredMic = emaFilter(absSample, gFilteredMic, kMicEmaAlpha);
+  gFilteredMic = emaFilter(absSample, gFilteredMic, kMicEmaAlphaFixed);
 
   int32_t peak = gDynamicMicPeak;
   if (peak > 4)
@@ -469,7 +474,11 @@ void executeFftFrame()
     gFftInput[i] *= gFftWindow[i];
   }
 
-  fft_config_t *plan = fft_init(kFftLength, FFT_REAL, FFT_FORWARD, gFftInput, gFftOutput);
+  if (gFftPlan == nullptr)
+  {
+    gFftPlan = fft_init(kFftLength, FFT_REAL, FFT_FORWARD, gFftInput, gFftOutput);
+  }
+  fft_config_t *plan = gFftPlan;
   if (plan == nullptr)
   {
     gFftDetectedHz = 0.0f;
@@ -595,8 +604,6 @@ void executeFftFrame()
   gFftDetectedHz = finalFrequency;
   gFftDetectedMagnitude = bestMagnitude;
   gFftFrameReady = true;
-
-  fft_destroy(plan);
 }
 
 void serviceFftAnalysis()
@@ -824,7 +831,7 @@ void updateMeasuredSampleRate(uint32_t captureStartMicros, uint32_t captureEndMi
 
 void processAudioBlock(int32_t *buffer, int32_t sampleCount)
 {
-  bool stereoPairs = ((sampleCount % 2) == 0);
+  bool stereoPairs = gUsingStereoSamplePairs;
   if (gMicSampleMode == MIC_SAMPLE_MODE_MONO_STREAM)
   {
     stereoPairs = false;
@@ -833,9 +840,14 @@ void processAudioBlock(int32_t *buffer, int32_t sampleCount)
   {
     stereoPairs = ((sampleCount % 2) == 0);
   }
-  else
+  else if (gStereoDetectBlockCount == 0)
   {
     stereoPairs = detectStereoSamplePairs(buffer, sampleCount);
+  }
+  gStereoDetectBlockCount++;
+  if (gStereoDetectBlockCount >= kStereoDetectInterval)
+  {
+    gStereoDetectBlockCount = 0;
   }
   gUsingStereoSamplePairs = stereoPairs;
 
@@ -870,13 +882,12 @@ void processAudioBlock(int32_t *buffer, int32_t sampleCount)
       {
         const int32_t largerAbs = (leftAbs > rightAbs) ? leftAbs : rightAbs;
         const int32_t smallerAbs = (leftAbs < rightAbs) ? leftAbs : rightAbs;
-        const float dominance = static_cast<float>(largerAbs + 1) / static_cast<float>(smallerAbs + 1);
-        if (dominance >= kStereoSlotDominanceRatio)
+        if ((largerAbs + 1) >= (smallerAbs + 1) * kStereoSlotDominanceRatioInt)
         {
           selected = (leftAbs >= rightAbs) ? leftDecoded : rightDecoded;
         }
       }
-      gMicDc = emaFilter(selected, gMicDc, kMicDcAlpha);
+      gMicDc = emaFilter(selected, gMicDc, kMicDcAlphaFixed);
       const int32_t sample = selected - gMicDc;
       updateMicrophoneEnvelope(sample);
 
@@ -914,7 +925,7 @@ void processAudioBlock(int32_t *buffer, int32_t sampleCount)
     {
       gMicLeftPeak -= 4;
     }
-    gMicDc = emaFilter(decoded, gMicDc, kMicDcAlpha);
+    gMicDc = emaFilter(decoded, gMicDc, kMicDcAlphaFixed);
     const int32_t sample = decoded - gMicDc;
     updateMicrophoneEnvelope(sample);
 
@@ -951,6 +962,7 @@ void i2sAudioWriterTask(void *param)
       int32_t *audioBuffer = sampler->getCapturedAudioBuffer();
       const int32_t sampleCount = sampler->getBufferSizeInBytes() / static_cast<int32_t>(sizeof(int32_t));
       processAudioBlock(audioBuffer, sampleCount);
+      sampler->bufferProcessed();
     }
   }
 }
@@ -966,23 +978,42 @@ void setupAudioCapture()
 
 unsigned long estimateNoteEventMillis(uint16_t timestamp)
 {
-  static unsigned long lastRolloverMillis = 0;
-  static unsigned long lastRolloverTimestamp = 0;
-  static unsigned long lastTimestamp = kBleTimestampRolloverMs + 1;
+  const unsigned long now = millis();
+  // BLE MIDI timestamps are 13-bit (0..8191ms) offsets within a rollover
+  // period. We simply treat them as a recent offset from the current time,
+  // clamped so they never place a note unreasonably far in the past or future.
+  const unsigned long tsMs = static_cast<unsigned long>(timestamp);
+  const unsigned long currentSlotPosition = now % kBleTimestampRolloverMs;
 
-  if (timestamp < lastTimestamp)
+  // Signed difference within one rollover period.
+  long delta = static_cast<long>(tsMs) - static_cast<long>(currentSlotPosition);
+
+  // Wrap into the range (-half_period, +half_period] to pick the nearest
+  // interpretation across the rollover boundary.
+  const long halfPeriod = static_cast<long>(kBleTimestampRolloverMs / 2);
+  if (delta > halfPeriod)
   {
-    lastRolloverMillis = millis();
-    lastRolloverTimestamp = timestamp;
+    delta -= static_cast<long>(kBleTimestampRolloverMs);
+  }
+  else if (delta <= -halfPeriod)
+  {
+    delta += static_cast<long>(kBleTimestampRolloverMs);
   }
 
-  const unsigned long now = millis();
-  const unsigned long elapsedSinceRollover = now - lastRolloverMillis;
-  const unsigned long intervalStart = now - elapsedSinceRollover - lastRolloverTimestamp;
-  const unsigned long rolloverCount = (now - intervalStart) / kBleTimestampRolloverMs;
+  // Clamp so a garbled timestamp can't place a note more than one full
+  // period away from now.
+  if (delta < -halfPeriod)
+  {
+    delta = -halfPeriod;
+  }
+  if (delta > halfPeriod)
+  {
+    delta = halfPeriod;
+  }
 
-  lastTimestamp = timestamp;
-  return intervalStart + (rolloverCount * kBleTimestampRolloverMs) + timestamp;
+  // Convert back to absolute millis.
+  const unsigned long result = static_cast<unsigned long>(static_cast<long>(now) + delta);
+  return result;
 }
 
 void applyMalletTimingFromLag(Mallet &mallet, unsigned long lagMs)
@@ -1062,13 +1093,13 @@ ScheduledStrike buildStrikeForVelocity(size_t malletIndex, uint8_t velocity)
   strike.lagMs = static_cast<unsigned long>(lagF);
 
   strike.profile.strikePower = constrain(static_cast<int>(lroundf(powerF)), 250, 1023);
-  strike.profile.strikeDuration = constrain(static_cast<int>(lroundf((lagF * 1.50f) + ((1.0f - shaped) * 120.0f))), 90, 1600);
+  strike.profile.strikeDuration = constrain(static_cast<int>(lroundf((lagF * 1.50f) + ((1.0f - shaped) * 120.0f))), 60, 600);
   strike.profile.coastPower = 0;
   strike.profile.coastDuration = constrain(static_cast<int>(lroundf(lagF * 0.10f)), 0, 300);
 
   // Keep positive rebound torque so the actuator actively catches the return.
-  strike.profile.reboundPower = constrain(static_cast<int>(lroundf(70.0f + (90.0f * shaped))), 40, 220);
-  strike.profile.reboundDuration = constrain(static_cast<int>(lroundf((lagF * 1.40f) + ((1.0f - shaped) * 90.0f))), 100, 2000);
+  strike.profile.reboundPower = constrain(static_cast<int>(lroundf(70.0f + (90.0f * shaped))), 40, 160);
+  strike.profile.reboundDuration = constrain(static_cast<int>(lroundf((lagF * 1.40f) + ((1.0f - shaped) * 90.0f))), 30, 300);
 
   return strike;
 }
@@ -1211,30 +1242,48 @@ void setMalletMidiFromCommand(const String &cmd)
   Serial.println(")");
 }
 
+constexpr size_t kSerialBufferMax = 64;
+char gSerialBuffer[kSerialBufferMax];
+size_t gSerialBufferPos = 0;
+
 void handleSerialCommands()
 {
-  if (!Serial.available())
+  while (Serial.available())
   {
-    return;
-  }
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\n' || c == '\r')
+    {
+      if (gSerialBufferPos == 0)
+      {
+        continue;
+      }
+      const String command(gSerialBuffer, gSerialBufferPos);
+      gSerialBufferPos = 0;
+      const SerialCommands::Handlers handlers = {
+        playCalibrationArpeggio,
+        runFullCalibration,
+        runFullCalibrationForMallet,
+        runVelocityCalibrationOnly,
+        printMalletStatus,
+        printAudioStatus,
+        printMicDiagnostics,
+        runMicProbe,
+        setMicChannelFromCommand,
+        setMicShiftFromCommand,
+        setMicModeFromCommand,
+        runFftTestForMallet,
+        setMalletMidiFromCommand,
+      };
+      SerialCommands::dispatch(command, handlers, kMalletCount, Serial);
+      return;
+    }
 
-  const String command = Serial.readStringUntil('\n');
-  const SerialCommands::Handlers handlers = {
-    playCalibrationArpeggio,
-    runFullCalibration,
-    runFullCalibrationForMallet,
-    runVelocityCalibrationOnly,
-    printMalletStatus,
-    printAudioStatus,
-    printMicDiagnostics,
-    runMicProbe,
-    setMicChannelFromCommand,
-    setMicShiftFromCommand,
-    setMicModeFromCommand,
-    runFftTestForMallet,
-    setMalletMidiFromCommand,
-  };
-  SerialCommands::dispatch(command, handlers, kMalletCount, Serial);
+    if (gSerialBufferPos < kSerialBufferMax - 1)
+    {
+      gSerialBuffer[gSerialBufferPos++] = c;
+      gSerialBuffer[gSerialBufferPos] = '\0';
+    }
+  }
 }
 
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint16_t timestamp)
@@ -1277,6 +1326,10 @@ void setup()
   }
 
   EEPROM.begin(kEepromBytes);
+  for (size_t i = 0; i < kMalletCount; ++i)
+  {
+    mallets[i].begin();
+  }
   initializeVelocityCalibrationDefaults();
   setupAudioCapture();
 

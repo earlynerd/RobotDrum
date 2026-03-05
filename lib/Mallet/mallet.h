@@ -2,6 +2,7 @@
 #define __MALLET_H
 
 #include <Arduino.h>
+#include <freertos/portmacro.h>
 
 #define StrikeQueueDepth    10
 
@@ -28,6 +29,7 @@ class Mallet{
   };
 
   Mallet(int pin, int MIDIpitch, int malletChannel, int strikePWM, int strikeTime, int coastPWM, int coastTime, int reboundPWM, int reboundTime);
+  void begin();
   int pin;
   int channel;
   int MIDInote;
@@ -77,5 +79,6 @@ class Mallet{
 
   unsigned long triggerTime;
   int malletPin;
+  portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
 };
 #endif
