@@ -203,16 +203,26 @@ void Mallet::setMidiPitch(int pitch)
   MIDInote = pitch;
 }
 
-int Mallet::getMidiPitch()
+int Mallet::getMidiPitch() const
 {
   return MIDInote;
 }
 
-unsigned long Mallet::getDelay(){
+unsigned long Mallet::getDelay() const{
   return lag;
 }
 
-unsigned long Mallet::getRetriggerGap()
+unsigned long Mallet::getRetriggerGap() const
 {
   return minRetriggerGapMs;
+}
+
+void Mallet::setCalibration(const CalibrationModel &model)
+{
+  calibration = model;
+}
+
+const Mallet::CalibrationModel &Mallet::getCalibration() const
+{
+  return calibration;
 }

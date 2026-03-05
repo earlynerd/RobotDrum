@@ -7,6 +7,17 @@
 
 class Mallet{
   public:
+  struct CalibrationModel
+  {
+    uint16_t softPower;
+    uint16_t hardPower;
+    uint16_t softLagMs;
+    uint16_t hardLagMs;
+    uint32_t softImpact;
+    uint32_t hardImpact;
+    bool valid;
+  };
+
   struct StrikeProfile {
     int strikePower;
     int strikeDuration;
@@ -35,10 +46,12 @@ class Mallet{
   void setDelay(unsigned long lagTime);
   void setRetriggerGap(unsigned long gapMs);
   void abortAndClearQueue();
-  int getMidiPitch();
+  int getMidiPitch() const;
   void setMidiPitch(int pitch);
-  unsigned long getDelay();
-  unsigned long getRetriggerGap();
+  unsigned long getDelay() const;
+  unsigned long getRetriggerGap() const;
+  void setCalibration(const CalibrationModel &model);
+  const CalibrationModel &getCalibration() const;
   
   enum State {
   IDLESTATE=0,
@@ -58,6 +71,7 @@ class Mallet{
   void handleQueuedStrikes();
   unsigned long minRetriggerGapMs = 0;
   unsigned long lastCycleEndMillis = 0;
+  CalibrationModel calibration = {460, 1023, 420, 300, 1, 2, false};
 
   State malletState = IDLESTATE;
 

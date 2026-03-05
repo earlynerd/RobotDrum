@@ -4,6 +4,10 @@
 #include <fft.h>
 #include "driver/i2s.h"
 #include "I2SMEMSSampler.h"
+#include "AudioDiagnostics.h"
+#include "Calibration.h"
+#include "CalibrationRuntime.h"
+#include "SerialCommands.h"
 #include "mallet.h"
 
 namespace
@@ -11,23 +15,23 @@ namespace
 constexpr unsigned long kMidiLeadTimeMs = 1000;
 constexpr unsigned long kBleTimestampRolloverMs = 8192;
 constexpr unsigned long kCalibrationImpactTimeoutMs = 2500;
-constexpr unsigned long kCalibrationMalletIdleTimeoutMs = 2500;
-constexpr unsigned long kImpactDetectGuardMs = 90;
+constexpr unsigned long kCalibrationMalletIdleTimeoutMs = 4000;
+constexpr unsigned long kImpactDetectGuardMs = 60;
 constexpr unsigned long kCalibrationHardMaxLagMs = 400;
 constexpr unsigned long kCalibrationSoftLagSlackMs = 180;
 constexpr unsigned long kCalibrationSoftMaxLagFloorMs = 300;
 constexpr unsigned long kRingdownTimeoutMs = 1800;
 constexpr unsigned long kRingdownStableMs = 80;
 constexpr unsigned long kFftTimeoutMs = 1200;
-constexpr unsigned long kMalletRetriggerGapMs = 90;
+constexpr unsigned long kMalletRetriggerGapMs = 60;
 constexpr unsigned long kPitchCaptureOffsetMs = 600;
 constexpr unsigned long kCalibrationInterStrikeDelayMs = 120;
-constexpr unsigned long kCalibrationInterMalletDelayMs = 300;
+constexpr unsigned long kCalibrationInterMalletDelayMs = 200;
 constexpr unsigned long kCalibrationSoftRetryDelayMs = 60;
-constexpr int kSampleRateHz = 16000;
-constexpr int kAudioBufferSamples = 256;
+constexpr int kSampleRateHz = 16384;
+constexpr int kAudioBufferSamples = 128;
 constexpr int kFftLength = 4096;
-constexpr int kCalibrationRepeats = 1;
+constexpr int kCalibrationRepeats = 3;
 constexpr float kMicEmaAlpha = 0.01f;
 constexpr float kMicDcAlpha = 0.001f;
 constexpr int kMicSlotTo24BitShiftBits = 8;
@@ -43,23 +47,45 @@ constexpr int32_t kImpactNoiseRiseFloor = 120;
 constexpr int32_t kImpactNoiseMultiplier = 3;
 constexpr int32_t kHardMinRiseFloor = 12000;
 constexpr int32_t kSoftMinRiseFloor = 15000;
-constexpr int32_t kSoftMinRiseHardDivisor = 4;
-constexpr uint16_t kSoftPowerInitial = 580;
+constexpr int32_t kSoftMinRiseHardDivisor = 5;
+constexpr uint16_t kSoftPowerInitial = 640;
 constexpr uint16_t kSoftPowerStep = 120;
 constexpr uint16_t kSoftPowerMax = 900;
 constexpr int kSoftPowerAttempts = 4;
 constexpr float kFftMinDetectHz = 90.0f;
 constexpr float kFftMaxDetectHz = 2200.0f;
+constexpr float kFftFundamentalMinHz = 95.0f;
+constexpr float kFftFundamentalMaxHz = 900.0f;
 constexpr float kFftMinMagnitude = 20.0f;
+constexpr float kFftSecondHarmonicWeight = 0.55f;
+constexpr float kFftThirdHarmonicWeight = 0.30f;
+constexpr float kFftFourthHarmonicWeight = 0.15f;
+constexpr float kFftSubharmonicPenaltyWeight = 0.70f;
+constexpr float kFftMinFundamentalToHarmonicRatio = 0.35f;
+constexpr float kFftWeakFundamentalPenalty = 6.0f;
+constexpr float kFftSecondWindowRelativeMagnitudeFloor = 0.60f;
+constexpr float kStereoSlotDominanceRatio = 2.0f;
+constexpr float kAutocorrMinDetectHz = 95.0f;
+constexpr float kAutocorrMaxDetectHz = 900.0f;
+constexpr float kAutocorrMinCorrelation = 0.20f;
+constexpr float kAutocorrDisagreementRatio = 1.10f;
+constexpr float kMeasuredSampleRateMinRatio = 0.96f;
+constexpr float kMeasuredSampleRateMaxRatio = 1.04f;
+constexpr float kMeasuredSampleRateSmoothing = 0.10f;
 constexpr bool kRunSelfCalibrationOnBootWhenMissing = true;
 constexpr char kBleDeviceName[] = "MusicRobot";
-constexpr uint32_t kCalibrationMagic = 0x52444232; // "RDB2"
-constexpr uint16_t kCalibrationVersion = 2;
 
 enum MicChannelSelect
 {
   MIC_CHANNEL_LEFT = 0,
   MIC_CHANNEL_RIGHT = 1,
+};
+
+enum MicSampleMode
+{
+  MIC_SAMPLE_MODE_AUTO = 0,
+  MIC_SAMPLE_MODE_STEREO_PAIRS = 1,
+  MIC_SAMPLE_MODE_MONO_STREAM = 2,
 };
 
 Mallet mallets[] = {
@@ -77,63 +103,20 @@ Mallet mallets[] = {
 
 constexpr size_t kMalletCount = sizeof(mallets) / sizeof(mallets[0]);
 
-struct CalibrationHeader
-{
-  uint32_t magic;
-  uint16_t version;
-  uint16_t malletCount;
-  uint32_t writeCount;
-};
-
-struct CalibrationEntry
-{
-  int16_t midiPitch;
-  uint16_t softPower;
-  uint16_t hardPower;
-  uint16_t softLagMs;
-  uint16_t hardLagMs;
-  uint32_t softImpact;
-  uint32_t hardImpact;
-  uint8_t valid;
-  uint8_t reserved[3];
-};
-
-struct VelocityCalibrationModel
-{
-  uint16_t softPower;
-  uint16_t hardPower;
-  uint16_t softLagMs;
-  uint16_t hardLagMs;
-  uint32_t softImpact;
-  uint32_t hardImpact;
-  bool valid;
-};
-
-struct StrikeMeasurement
-{
-  unsigned long lagMs;
-  int32_t peakRise;
-  bool impactDetected;
-  int32_t ambient;
-  int32_t triggerThreshold;
-  int32_t noiseP2P;
-  int32_t minRiseRequired;
-};
-
 struct ScheduledStrike
 {
   Mallet::StrikeProfile profile;
   unsigned long lagMs;
 };
 
-constexpr size_t kCalibrationHeaderAddress = 0;
-constexpr size_t kCalibrationEntriesAddress = sizeof(CalibrationHeader);
-constexpr size_t kCalibrationStorageBytes = sizeof(CalibrationHeader) + (sizeof(CalibrationEntry) * kMalletCount);
+struct FftWindowEstimate
+{
+  float frequencyHz;
+  float magnitude;
+  bool ready;
+};
+
 constexpr size_t kEepromBytes = 512;
-
-static_assert(kCalibrationStorageBytes <= kEepromBytes, "Calibration EEPROM storage exceeds reserved bytes");
-
-VelocityCalibrationModel gVelocityCalibration[kMalletCount];
 
 I2SSampler *gSampler = nullptr;
 TaskHandle_t gAudioWriterTaskHandle = nullptr;
@@ -145,6 +128,8 @@ volatile int32_t gMicDc = 0;
 volatile int32_t gMicLeftPeak = 0;
 volatile int32_t gMicRightPeak = 0;
 volatile int gMicChannelSelect = MIC_CHANNEL_LEFT;
+volatile int gMicSampleMode = MIC_SAMPLE_MODE_AUTO;
+volatile bool gUsingStereoSamplePairs = true;
 volatile int gMicGainShiftBits = kMicGainShiftDefaultBits;
 volatile bool gCalibrationInProgress = false;
 
@@ -153,6 +138,11 @@ volatile bool gFftFrameReady = false;
 volatile bool gFftFramePending = false;
 volatile float gFftDetectedHz = 0.0f;
 volatile float gFftDetectedMagnitude = 0.0f;
+volatile float gFftAutocorrHz = 0.0f;
+volatile float gFftAutocorrCorrelation = 0.0f;
+volatile float gFftMeasuredSampleRateHz = static_cast<float>(kSampleRateHz);
+volatile float gFftAnalysisSampleRateHz = static_cast<float>(kSampleRateHz);
+volatile uint32_t gFftCaptureStartMicros = 0;
 volatile int gFftSampleCursor = 0;
 float gFftInput[kFftLength];
 float gFftOutput[kFftLength];
@@ -294,7 +284,7 @@ int frequencyToMidi(float frequencyHz)
     return -1;
   }
 
-  return midi+1;
+  return midi;
 }
 
 void ensureFftWindow()
@@ -318,8 +308,161 @@ float fftMagnitudeAtBin(const fft_config_t *plan, int bin)
   return sqrtf((real * real) + (imag * imag));
 }
 
+float fftMagnitudeAtBinOrZero(const fft_config_t *plan, int bin, int minBin, int maxBin)
+{
+  if (bin < minBin || bin > maxBin)
+  {
+    return 0.0f;
+  }
+  return fftMagnitudeAtBin(plan, bin);
+}
+
+float scoreFundamentalBin(const fft_config_t *plan, int bin, int minBin, int maxBin, float fundamentalMagnitude)
+{
+  const float secondHarmonic = fftMagnitudeAtBinOrZero(plan, bin * 2, minBin, maxBin);
+  const float thirdHarmonic = fftMagnitudeAtBinOrZero(plan, bin * 3, minBin, maxBin);
+  const float fourthHarmonic = fftMagnitudeAtBinOrZero(plan, bin * 4, minBin, maxBin);
+
+  float subharmonic = 0.0f;
+  const int subharmonicBin = bin / 2;
+  if (subharmonicBin >= minBin)
+  {
+    subharmonic = fftMagnitudeAtBin(plan, subharmonicBin);
+  }
+
+  const float eps = 0.001f;
+  float score = logf(fundamentalMagnitude + eps) +
+                (kFftSecondHarmonicWeight * logf(secondHarmonic + eps)) +
+                (kFftThirdHarmonicWeight * logf(thirdHarmonic + eps)) +
+                (kFftFourthHarmonicWeight * logf(fourthHarmonic + eps)) -
+                (kFftSubharmonicPenaltyWeight * logf(subharmonic + eps));
+
+  const float strongestHarmonic = fmaxf(secondHarmonic, fmaxf(thirdHarmonic, fourthHarmonic));
+  if (strongestHarmonic > 1.0f)
+  {
+    const float ratio = fundamentalMagnitude / strongestHarmonic;
+    if (ratio < kFftMinFundamentalToHarmonicRatio)
+    {
+      score -= kFftWeakFundamentalPenalty;
+    }
+  }
+
+  return score;
+}
+
+float estimateAutocorrelationFrequency(float *samples, int sampleCount, float sampleRateHz, float minHz, float maxHz, float *correlationOut)
+{
+  if (correlationOut != nullptr)
+  {
+    *correlationOut = 0.0f;
+  }
+  if (sampleCount < 32 || minHz <= 0.0f || maxHz <= minHz)
+  {
+    return 0.0f;
+  }
+
+  int minLag = static_cast<int>(floorf(sampleRateHz / maxHz));
+  int maxLag = static_cast<int>(ceilf(sampleRateHz / minHz));
+  if (minLag < 2)
+  {
+    minLag = 2;
+  }
+  if (maxLag >= sampleCount - 4)
+  {
+    maxLag = sampleCount - 4;
+  }
+  if (maxLag <= minLag)
+  {
+    return 0.0f;
+  }
+
+  float bestCorr = -1.0f;
+  int bestLag = minLag;
+  float prevCorr = -1.0f;
+  float corrAtBestMinus = -1.0f;
+  float corrAtBest = -1.0f;
+  float corrAtBestPlus = -1.0f;
+
+  for (int lag = minLag; lag <= maxLag; ++lag)
+  {
+    float sumXY = 0.0f;
+    float sumXX = 0.0f;
+    float sumYY = 0.0f;
+    const int limit = sampleCount - lag;
+    for (int i = 0; i < limit; ++i)
+    {
+      const float x = samples[i];
+      const float y = samples[i + lag];
+      sumXY += x * y;
+      sumXX += x * x;
+      sumYY += y * y;
+    }
+
+    float corr = 0.0f;
+    const float denom = sqrtf(sumXX * sumYY);
+    if (denom > 0.001f)
+    {
+      corr = sumXY / denom;
+    }
+
+    if (corr > bestCorr)
+    {
+      bestCorr = corr;
+      bestLag = lag;
+      corrAtBestMinus = prevCorr;
+      corrAtBest = corr;
+      corrAtBestPlus = -1.0f;
+    }
+    else if (lag == bestLag + 1)
+    {
+      corrAtBestPlus = corr;
+    }
+
+    prevCorr = corr;
+  }
+
+  if (bestCorr < 0.0f)
+  {
+    return 0.0f;
+  }
+
+  float refinedLag = static_cast<float>(bestLag);
+  if (corrAtBestMinus >= 0.0f && corrAtBestPlus >= 0.0f)
+  {
+    const float denom = (corrAtBestMinus - (2.0f * corrAtBest) + corrAtBestPlus);
+    if (fabsf(denom) > 0.0001f)
+    {
+      const float delta = 0.5f * (corrAtBestMinus - corrAtBestPlus) / denom;
+      if (delta > -1.0f && delta < 1.0f)
+      {
+        refinedLag += delta;
+      }
+    }
+  }
+
+  if (correlationOut != nullptr)
+  {
+    *correlationOut = bestCorr;
+  }
+
+  if (refinedLag < 1.0f)
+  {
+    return 0.0f;
+  }
+  return sampleRateHz / refinedLag;
+}
+
 void executeFftFrame()
 {
+  float analysisSampleRateHz = gFftAnalysisSampleRateHz;
+  if (analysisSampleRateHz < 4000.0f || analysisSampleRateHz > 50000.0f)
+  {
+    analysisSampleRateHz = static_cast<float>(kSampleRateHz);
+  }
+
+  float autocorrCorrelation = 0.0f;
+  const float autocorrFrequency = estimateAutocorrelationFrequency(gFftInput, kFftLength, analysisSampleRateHz, kAutocorrMinDetectHz, kAutocorrMaxDetectHz, &autocorrCorrelation);
+
   ensureFftWindow();
   for (int i = 0; i < kFftLength; ++i)
   {
@@ -337,24 +480,74 @@ void executeFftFrame()
 
   fft_execute(plan);
 
-  const int minBin = static_cast<int>(ceilf(kFftMinDetectHz * static_cast<float>(kFftLength) / static_cast<float>(kSampleRateHz)));
-  const int maxBin = static_cast<int>(floorf(kFftMaxDetectHz * static_cast<float>(kFftLength) / static_cast<float>(kSampleRateHz)));
+  const int minBin = static_cast<int>(ceilf(kFftMinDetectHz * static_cast<float>(kFftLength) / analysisSampleRateHz));
+  const int maxBin = static_cast<int>(floorf(kFftMaxDetectHz * static_cast<float>(kFftLength) / analysisSampleRateHz));
+  const int minFundamentalBin = static_cast<int>(ceilf(kFftFundamentalMinHz * static_cast<float>(kFftLength) / analysisSampleRateHz));
+  const int maxFundamentalBin = static_cast<int>(floorf(kFftFundamentalMaxHz * static_cast<float>(kFftLength) / analysisSampleRateHz));
+
+  const int nyquistBin = (plan->size / 2) - 1;
+  const int searchMinBin = (minBin > 1) ? minBin : 1;
+  int searchMaxBin = (maxBin < nyquistBin) ? maxBin : nyquistBin;
+  if (searchMaxBin < searchMinBin)
+  {
+    searchMaxBin = searchMinBin;
+  }
+
+  int candidateMinBin = (minFundamentalBin > searchMinBin) ? minFundamentalBin : searchMinBin;
+  int candidateMaxBin = (maxFundamentalBin < searchMaxBin) ? maxFundamentalBin : searchMaxBin;
+  if (candidateMinBin > candidateMaxBin)
+  {
+    candidateMinBin = searchMinBin;
+    candidateMaxBin = searchMaxBin;
+  }
 
   float bestMagnitude = 0.0f;
-  int bestBin = minBin;
+  float bestScore = -1000000000.0f;
+  int bestBin = candidateMinBin;
+  bool foundCandidate = false;
 
-  for (int bin = minBin; bin <= maxBin && bin < (plan->size / 2); ++bin)
+  for (int bin = candidateMinBin; bin <= candidateMaxBin; ++bin)
   {
-    const float magnitude = fftMagnitudeAtBin(plan, bin);
-    if (magnitude > bestMagnitude)
+    const float center = fftMagnitudeAtBin(plan, bin);
+    bool localPeak = true;
+    if (bin > searchMinBin)
     {
-      bestMagnitude = magnitude;
+      localPeak = localPeak && (center >= fftMagnitudeAtBin(plan, bin - 1));
+    }
+    if (bin < searchMaxBin)
+    {
+      localPeak = localPeak && (center >= fftMagnitudeAtBin(plan, bin + 1));
+    }
+    if (!localPeak)
+    {
+      continue;
+    }
+
+    const float score = scoreFundamentalBin(plan, bin, searchMinBin, searchMaxBin, center);
+    if (!foundCandidate || score > bestScore)
+    {
+      bestMagnitude = center;
+      bestScore = score;
       bestBin = bin;
+      foundCandidate = true;
+    }
+  }
+
+  if (!foundCandidate)
+  {
+    for (int bin = candidateMinBin; bin <= candidateMaxBin; ++bin)
+    {
+      const float magnitude = fftMagnitudeAtBin(plan, bin);
+      if (magnitude > bestMagnitude)
+      {
+        bestMagnitude = magnitude;
+        bestBin = bin;
+      }
     }
   }
 
   float refinedBin = static_cast<float>(bestBin);
-  if (bestBin > minBin && bestBin < maxBin)
+  if (bestBin > searchMinBin && bestBin < searchMaxBin)
   {
     const float m1 = fftMagnitudeAtBin(plan, bestBin - 1);
     const float m2 = bestMagnitude;
@@ -370,8 +563,36 @@ void executeFftFrame()
     }
   }
 
-  const float bestFrequency = refinedBin * static_cast<float>(kSampleRateHz) / static_cast<float>(kFftLength);
-  gFftDetectedHz = bestFrequency;
+  const float bestFrequency = refinedBin * analysisSampleRateHz / static_cast<float>(kFftLength);
+  gFftAutocorrHz = autocorrFrequency;
+  gFftAutocorrCorrelation = autocorrCorrelation;
+
+  float finalFrequency = bestFrequency;
+  if (autocorrFrequency > 0.0f && autocorrCorrelation >= kAutocorrMinCorrelation)
+  {
+    if (bestFrequency <= 0.0f)
+    {
+      finalFrequency = autocorrFrequency;
+    }
+    else
+    {
+      float ratio = bestFrequency / autocorrFrequency;
+      if (ratio < 1.0f)
+      {
+        ratio = 1.0f / ratio;
+      }
+      if (ratio > kAutocorrDisagreementRatio)
+      {
+        finalFrequency = autocorrFrequency;
+      }
+      else
+      {
+        finalFrequency = 0.5f * (bestFrequency + autocorrFrequency);
+      }
+    }
+  }
+
+  gFftDetectedHz = finalFrequency;
   gFftDetectedMagnitude = bestMagnitude;
   gFftFrameReady = true;
 
@@ -387,9 +608,237 @@ void serviceFftAnalysis()
   }
 }
 
+bool captureFftWindow(FftWindowEstimate *estimate)
+{
+  if (estimate != nullptr)
+  {
+    estimate->frequencyHz = 0.0f;
+    estimate->magnitude = 0.0f;
+    estimate->ready = false;
+  }
+
+  gFftFrameReady = false;
+  gFftFramePending = false;
+  gFftSampleCursor = 0;
+  gFftCaptureStartMicros = micros();
+  gFftCaptureArmed = true;
+
+  const unsigned long start = millis();
+  while (!gFftFrameReady && (millis() - start < kFftTimeoutMs))
+  {
+    serviceFftAnalysis();
+    updateMallets();
+    // Yield so the audio writer task can keep up with incoming I2S buffers.
+    delay(1);
+  }
+
+  gFftCaptureArmed = false;
+
+  if (!gFftFrameReady)
+  {
+    return false;
+  }
+
+  if (estimate != nullptr)
+  {
+    estimate->frequencyHz = gFftDetectedHz;
+    estimate->magnitude = gFftDetectedMagnitude;
+    estimate->ready = true;
+  }
+  return true;
+}
+
+bool estimateIsValid(const FftWindowEstimate &estimate)
+{
+  return estimate.ready &&
+         estimate.frequencyHz > 0.0f &&
+         estimate.magnitude >= kFftMinMagnitude;
+}
+
+void chooseStableFftEstimate(const FftWindowEstimate &first, const FftWindowEstimate &second, float *frequencyHz, float *magnitude)
+{
+  auto assignEstimate = [&](const FftWindowEstimate &selected) {
+    if (frequencyHz != nullptr)
+    {
+      *frequencyHz = selected.frequencyHz;
+    }
+    if (magnitude != nullptr)
+    {
+      *magnitude = selected.magnitude;
+    }
+  };
+
+  const bool firstValid = estimateIsValid(first);
+  const bool secondValid = estimateIsValid(second);
+
+  if (!firstValid && !secondValid)
+  {
+    if (frequencyHz != nullptr)
+    {
+      *frequencyHz = 0.0f;
+    }
+    if (magnitude != nullptr)
+    {
+      *magnitude = 0.0f;
+    }
+    return;
+  }
+
+  if (firstValid && !secondValid)
+  {
+    assignEstimate(first);
+    return;
+  }
+  if (!firstValid && secondValid)
+  {
+    assignEstimate(second);
+    return;
+  }
+
+  const int firstMidi = frequencyToMidi(first.frequencyHz);
+  const int secondMidi = frequencyToMidi(second.frequencyHz);
+  if (firstMidi >= 0 && firstMidi == secondMidi)
+  {
+    const float firstWeight = (first.magnitude > 1.0f) ? first.magnitude : 1.0f;
+    const float secondWeight = (second.magnitude > 1.0f) ? second.magnitude : 1.0f;
+    if (frequencyHz != nullptr)
+    {
+      *frequencyHz = ((first.frequencyHz * firstWeight) + (second.frequencyHz * secondWeight)) / (firstWeight + secondWeight);
+    }
+    if (magnitude != nullptr)
+    {
+      *magnitude = (first.magnitude > second.magnitude) ? first.magnitude : second.magnitude;
+    }
+    return;
+  }
+
+  const FftWindowEstimate &lower = (first.frequencyHz <= second.frequencyHz) ? first : second;
+  const FftWindowEstimate &higher = (&lower == &first) ? second : first;
+  const float harmonicRatio = higher.frequencyHz / lower.frequencyHz;
+  if ((harmonicRatio > 1.80f && harmonicRatio < 2.20f) ||
+      (harmonicRatio > 2.70f && harmonicRatio < 3.30f))
+  {
+    assignEstimate(lower);
+    return;
+  }
+
+  // Prefer the later window when it is still strong enough because
+  // the sustained fundamental often outlasts the early harmonic burst.
+  if (second.magnitude >= (first.magnitude * kFftSecondWindowRelativeMagnitudeFloor))
+  {
+    assignEstimate(second);
+  }
+  else
+  {
+    assignEstimate(first);
+  }
+}
+
+bool detectStereoSamplePairs(int32_t *buffer, int32_t sampleCount)
+{
+  if ((sampleCount % 2) != 0 || sampleCount < 8)
+  {
+    return false;
+  }
+
+  int64_t evenAbsSum = 0;
+  int64_t oddAbsSum = 0;
+  int64_t pairDiffAbsSum = 0;
+  const int pairCount = sampleCount / 2;
+
+  for (int32_t i = 0; i < sampleCount; i += 2)
+  {
+    const int32_t evenDecoded = decodeMicSample(buffer[i]);
+    const int32_t oddDecoded = decodeMicSample(buffer[i + 1]);
+    const int32_t evenAbs = (evenDecoded >= 0) ? evenDecoded : -evenDecoded;
+    const int32_t oddAbs = (oddDecoded >= 0) ? oddDecoded : -oddDecoded;
+    int32_t pairDiff = evenDecoded - oddDecoded;
+    if (pairDiff < 0)
+    {
+      pairDiff = -pairDiff;
+    }
+
+    evenAbsSum += evenAbs;
+    oddAbsSum += oddAbs;
+    pairDiffAbsSum += pairDiff;
+  }
+
+  const int64_t smallerAbs = (evenAbsSum < oddAbsSum) ? evenAbsSum : oddAbsSum;
+  const int64_t largerAbs = (evenAbsSum > oddAbsSum) ? evenAbsSum : oddAbsSum;
+  const float channelEnergyRatio = static_cast<float>(largerAbs + 1) / static_cast<float>(smallerAbs + 1);
+  const float meanAbs = static_cast<float>(evenAbsSum + oddAbsSum) / static_cast<float>(sampleCount);
+  const float meanPairDiff = static_cast<float>(pairDiffAbsSum) / static_cast<float>(pairCount);
+  const float normalizedPairDiff = meanPairDiff / (meanAbs + 1.0f);
+
+  const bool oneSlotMostlySilent = channelEnergyRatio > 6.0f;
+  const bool duplicatedStereo = (channelEnergyRatio < 2.0f) && (normalizedPairDiff < 0.015f);
+  const bool monoSequential = (channelEnergyRatio < 2.0f) && (normalizedPairDiff > 0.03f);
+
+  if (oneSlotMostlySilent || duplicatedStereo)
+  {
+    return true;
+  }
+  if (monoSequential)
+  {
+    return false;
+  }
+  return true;
+}
+
+void updateMeasuredSampleRate(uint32_t captureStartMicros, uint32_t captureEndMicros)
+{
+  if (captureStartMicros == 0 || captureEndMicros <= captureStartMicros)
+  {
+    return;
+  }
+
+  const uint32_t elapsedMicros = captureEndMicros - captureStartMicros;
+  if (elapsedMicros == 0)
+  {
+    return;
+  }
+
+  const float measuredRate = (static_cast<float>(kFftLength) * 1000000.0f) / static_cast<float>(elapsedMicros);
+  if (measuredRate <= 4000.0f || measuredRate >= 50000.0f)
+  {
+    return;
+  }
+
+  gFftMeasuredSampleRateHz = measuredRate;
+
+  const float nominalRate = static_cast<float>(kSampleRateHz);
+  const float minAccepted = nominalRate * kMeasuredSampleRateMinRatio;
+  const float maxAccepted = nominalRate * kMeasuredSampleRateMaxRatio;
+  const float prevRate = gFftAnalysisSampleRateHz;
+
+  if (measuredRate >= minAccepted && measuredRate <= maxAccepted)
+  {
+    gFftAnalysisSampleRateHz = prevRate + ((measuredRate - prevRate) * kMeasuredSampleRateSmoothing);
+  }
+  else
+  {
+    // Keep analysis rate stable when capture timing has a scheduling outlier.
+    gFftAnalysisSampleRateHz = prevRate + ((nominalRate - prevRate) * 0.05f);
+  }
+}
+
 void processAudioBlock(int32_t *buffer, int32_t sampleCount)
 {
-  const bool stereoPairs = ((sampleCount % 2) == 0);
+  bool stereoPairs = ((sampleCount % 2) == 0);
+  if (gMicSampleMode == MIC_SAMPLE_MODE_MONO_STREAM)
+  {
+    stereoPairs = false;
+  }
+  else if (gMicSampleMode == MIC_SAMPLE_MODE_STEREO_PAIRS)
+  {
+    stereoPairs = ((sampleCount % 2) == 0);
+  }
+  else
+  {
+    stereoPairs = detectStereoSamplePairs(buffer, sampleCount);
+  }
+  gUsingStereoSamplePairs = stereoPairs;
+
   if (stereoPairs)
   {
     for (int32_t i = 0; i < sampleCount; i += 2)
@@ -416,7 +865,17 @@ void processAudioBlock(int32_t *buffer, int32_t sampleCount)
         gMicRightPeak -= 4;
       }
 
-      const int32_t selected = (gMicChannelSelect == MIC_CHANNEL_RIGHT) ? rightDecoded : leftDecoded;
+      int32_t selected = (gMicChannelSelect == MIC_CHANNEL_RIGHT) ? rightDecoded : leftDecoded;
+      if (gMicSampleMode == MIC_SAMPLE_MODE_AUTO)
+      {
+        const int32_t largerAbs = (leftAbs > rightAbs) ? leftAbs : rightAbs;
+        const int32_t smallerAbs = (leftAbs < rightAbs) ? leftAbs : rightAbs;
+        const float dominance = static_cast<float>(largerAbs + 1) / static_cast<float>(smallerAbs + 1);
+        if (dominance >= kStereoSlotDominanceRatio)
+        {
+          selected = (leftAbs >= rightAbs) ? leftDecoded : rightDecoded;
+        }
+      }
       gMicDc = emaFilter(selected, gMicDc, kMicDcAlpha);
       const int32_t sample = selected - gMicDc;
       updateMicrophoneEnvelope(sample);
@@ -432,6 +891,7 @@ void processAudioBlock(int32_t *buffer, int32_t sampleCount)
 
         if (gFftSampleCursor >= kFftLength)
         {
+          updateMeasuredSampleRate(gFftCaptureStartMicros, micros());
           gFftCaptureArmed = false;
           gFftFramePending = true;
           gFftSampleCursor = 0;
@@ -469,6 +929,7 @@ void processAudioBlock(int32_t *buffer, int32_t sampleCount)
 
       if (gFftSampleCursor >= kFftLength)
       {
+        updateMeasuredSampleRate(gFftCaptureStartMicros, micros());
         gFftCaptureArmed = false;
         gFftFramePending = true;
         gFftSampleCursor = 0;
@@ -497,7 +958,9 @@ void i2sAudioWriterTask(void *param)
 void setupAudioCapture()
 {
   gSampler = new I2SMEMSSampler(gI2sPins, true);
-  xTaskCreatePinnedToCore(i2sAudioWriterTask, "I2S Writer Task", 8192, gSampler, 1, &gAudioWriterTaskHandle, 1);
+  // Keep writer priority above the loop task so we do not starve audio capture
+  // during calibration waits on the same core.
+  xTaskCreatePinnedToCore(i2sAudioWriterTask, "I2S Writer Task", 8192, gSampler, 2, &gAudioWriterTaskHandle, 1);
   gSampler->start(I2S_NUM_1, gI2sConfig, kAudioBufferSamples * static_cast<int32_t>(sizeof(int32_t)), gAudioWriterTaskHandle);
 }
 
@@ -522,234 +985,14 @@ unsigned long estimateNoteEventMillis(uint16_t timestamp)
   return intervalStart + (rolloverCount * kBleTimestampRolloverMs) + timestamp;
 }
 
-void configureProbeStrike(Mallet &mallet, int strikePower)
-{
-  mallet.strikePower = constrain(strikePower, 250, 1023);
-  mallet.strikeDuration = 420;
-  mallet.coastPower = 0;
-  mallet.coastDuration = 1;
-  mallet.reboundPower = 0;
-  mallet.reboundDuration = 1;
-}
-
 void applyMalletTimingFromLag(Mallet &mallet, unsigned long lagMs)
 {
-  const unsigned long strikeDuration = constrain(static_cast<unsigned long>(lagMs * 1.5f), 100UL, 1600UL);
-  const unsigned long coastDuration = constrain(static_cast<unsigned long>(lagMs * 0.10f), 0UL, 300UL);
-  const unsigned long reboundDuration = constrain(static_cast<unsigned long>(lagMs * 1.4f), 120UL, 2000UL);
-
-  mallet.strikePower = 1023;
-  mallet.strikeDuration = static_cast<int>(strikeDuration);
-  mallet.coastPower = 0;
-  mallet.coastDuration = static_cast<int>(coastDuration);
-  mallet.reboundPower = 100;
-  mallet.reboundDuration = static_cast<int>(reboundDuration);
-}
-
-void configurePitchProbeStrike(Mallet &mallet, const VelocityCalibrationModel &model)
-{
-  const unsigned long lagForTiming = model.valid ? static_cast<unsigned long>(model.hardLagMs) : 140UL;
-  applyMalletTimingFromLag(mallet, lagForTiming);
-  mallet.strikePower = constrain(static_cast<int>(model.hardPower), 250, 1023);
-}
-
-int32_t sampleAmbientMic(unsigned long windowMs)
-{
-  int32_t ambientPeak = 0;
-  const unsigned long start = millis();
-  while (millis() - start < windowMs)
-  {
-    const int32_t current = gFilteredMic;
-    if (current > ambientPeak)
-    {
-      ambientPeak = current;
-    }
-    updateMallets();
-    delay(1);
-  }
-  return ambientPeak;
-}
-
-struct AmbientWindowStats
-{
-  int32_t peak;
-  int32_t minValue;
-  int32_t maxValue;
-  int32_t peakToPeak;
-};
-
-AmbientWindowStats sampleAmbientWindow(unsigned long windowMs)
-{
-  AmbientWindowStats stats = {};
-  stats.peak = 0;
-  stats.minValue = INT32_MAX;
-  stats.maxValue = INT32_MIN;
-
-  const unsigned long start = millis();
-  while (millis() - start < windowMs)
-  {
-    const int32_t current = gFilteredMic;
-    if (current > stats.peak)
-    {
-      stats.peak = current;
-    }
-    if (current < stats.minValue)
-    {
-      stats.minValue = current;
-    }
-    if (current > stats.maxValue)
-    {
-      stats.maxValue = current;
-    }
-    updateMallets();
-    delay(1);
-  }
-
-  if (stats.maxValue >= stats.minValue)
-  {
-    stats.peakToPeak = stats.maxValue - stats.minValue;
-  }
-  else
-  {
-    stats.peakToPeak = 0;
-  }
-
-  return stats;
-}
-
-void waitForRingdown(unsigned long timeoutMs)
-{
-  const unsigned long start = millis();
-  unsigned long stableStart = 0;
-  int32_t runningFloor = gFilteredMic;
-  while (millis() - start < timeoutMs)
-  {
-    const int32_t mic = gFilteredMic;
-    if (mic < runningFloor)
-    {
-      runningFloor = mic;
-    }
-
-    const int32_t quietThreshold = runningFloor + kRingdownThresholdRise;
-    if (mic <= quietThreshold)
-    {
-      if (stableStart == 0)
-      {
-        stableStart = millis();
-      }
-      if (millis() - stableStart >= kRingdownStableMs)
-      {
-        return;
-      }
-    }
-    else
-    {
-      stableStart = 0;
-    }
-
-    updateMallets();
-    delay(1);
-  }
-}
-
-bool waitForMalletIdle(Mallet &mallet, unsigned long timeoutMs)
-{
-  const unsigned long start = millis();
-  while (!mallet.isIdle() && (millis() - start < timeoutMs))
-  {
-    updateMallets();
-    delay(1);
-  }
-  return mallet.isIdle();
-}
-
-StrikeMeasurement measureStrikeResponse(Mallet &mallet, int32_t thresholdRise, unsigned long maxImpactLagMs, int32_t minRiseRequired)
-{
-  StrikeMeasurement result = {
-    kCalibrationImpactTimeoutMs,
-    0,
-    false,
-    gFilteredMic,
-    gFilteredMic + thresholdRise,
-    0,
-    minRiseRequired,
-  };
-
-  if (!waitForMalletIdle(mallet, kCalibrationMalletIdleTimeoutMs))
-  {
-    return result;
-  }
-  waitForRingdown(kRingdownTimeoutMs);
-  if (!waitForMalletIdle(mallet, kCalibrationMalletIdleTimeoutMs))
-  {
-    return result;
-  }
-  const AmbientWindowStats ambientWindow = sampleAmbientWindow(120);
-  const int32_t ambient = ambientWindow.peak;
-  int32_t adaptiveRise = thresholdRise;
-  const int32_t noiseRise = (ambientWindow.peakToPeak * kImpactNoiseMultiplier) + kImpactNoiseRiseFloor;
-  if (noiseRise > adaptiveRise)
-  {
-    adaptiveRise = noiseRise;
-  }
-  const int32_t triggerThreshold = ambient + adaptiveRise;
-  const int32_t rearmThreshold = triggerThreshold - kImpactThresholdHysteresis;
-
-  result = {
-    maxImpactLagMs,
-    0,
-    false,
-    ambient,
-    triggerThreshold,
-    ambientWindow.peakToPeak,
-    minRiseRequired,
-  };
-
-  int32_t detectWindowPeak = ambient;
-  const unsigned long startMicros = micros();
-  mallet.triggerMallet();
-  bool crossedBelowThreshold = (gFilteredMic <= rearmThreshold);
-
-  while ((micros() - startMicros) < (kCalibrationImpactTimeoutMs * 1000UL))
-  {
-    const int32_t mic = gFilteredMic;
-    const unsigned long elapsedMs = (micros() - startMicros) / 1000UL;
-    if (elapsedMs <= maxImpactLagMs && mic > detectWindowPeak)
-    {
-      detectWindowPeak = mic;
-    }
-
-    if (mic <= rearmThreshold)
-    {
-      crossedBelowThreshold = true;
-    }
-
-    if (!result.impactDetected &&
-        elapsedMs >= kImpactDetectGuardMs &&
-        elapsedMs <= maxImpactLagMs &&
-        crossedBelowThreshold &&
-        mic >= triggerThreshold)
-    {
-      result.impactDetected = true;
-      result.lagMs = elapsedMs;
-    }
-
-    updateMallets();
-    delay(1);
-  }
-
-  result.peakRise = (detectWindowPeak > ambient) ? (detectWindowPeak - ambient) : 0;
-  if (result.impactDetected && result.peakRise < minRiseRequired)
-  {
-    result.impactDetected = false;
-    result.lagMs = maxImpactLagMs;
-  }
-  return result;
+  CalibrationRuntime::applyMalletTimingFromLag(mallet, lagMs);
 }
 
 int detectPitchFromStrike(Mallet &mallet, unsigned long captureDelayMs, float *detectedHz, float *detectedMagnitude)
 {
-  waitForMalletIdle(mallet, kCalibrationMalletIdleTimeoutMs);
+  CalibrationRuntime::waitForMalletIdle(mallet, kCalibrationMalletIdleTimeoutMs);
   gFftFrameReady = false;
   gFftFramePending = false;
   gFftSampleCursor = 0;
@@ -764,36 +1007,14 @@ int detectPitchFromStrike(Mallet &mallet, unsigned long captureDelayMs, float *d
     delay(1);
   }
 
-  gFftFrameReady = false;
-  gFftFramePending = false;
-  gFftSampleCursor = 0;
-  gFftCaptureArmed = true;
+  FftWindowEstimate firstWindow = {};
+  FftWindowEstimate secondWindow = {};
+  captureFftWindow(&firstWindow);
+  captureFftWindow(&secondWindow);
 
-  const unsigned long start = millis();
-  while (!gFftFrameReady && (millis() - start < kFftTimeoutMs))
-  {
-    serviceFftAnalysis();
-    updateMallets();
-    delay(1);
-  }
-
-  gFftCaptureArmed = false;
-
-  if (!gFftFrameReady)
-  {
-    if (detectedHz != nullptr)
-    {
-      *detectedHz = 0.0f;
-    }
-    if (detectedMagnitude != nullptr)
-    {
-      *detectedMagnitude = 0.0f;
-    }
-    return -1;
-  }
-
-  const float frequency = gFftDetectedHz;
-  const float magnitude = gFftDetectedMagnitude;
+  float frequency = 0.0f;
+  float magnitude = 0.0f;
+  chooseStableFftEstimate(firstWindow, secondWindow, &frequency, &magnitude);
 
   if (detectedHz != nullptr)
   {
@@ -814,179 +1035,21 @@ int detectPitchFromStrike(Mallet &mallet, unsigned long captureDelayMs, float *d
 
 void setVelocityCalibrationDefaults(size_t index)
 {
-  gVelocityCalibration[index].softPower = 460;
-  gVelocityCalibration[index].hardPower = 1023;
-  gVelocityCalibration[index].softLagMs = 420;
-  gVelocityCalibration[index].hardLagMs = 300;
-  gVelocityCalibration[index].softImpact = 1;
-  gVelocityCalibration[index].hardImpact = 2;
-  gVelocityCalibration[index].valid = false;
+  Calibration::setDefaults(mallets[index]);
 }
 
 void initializeVelocityCalibrationDefaults()
 {
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    setVelocityCalibrationDefaults(i);
-  }
-}
-
-bool calibrateVelocityForMallet(size_t index)
-{
-  Mallet &mallet = mallets[index];
-  uint16_t softPower = kSoftPowerInitial;
-  const uint16_t hardPower = 1023;
-  const int repeats = kCalibrationRepeats;
-
-  unsigned long softLagSum = 0;
-  unsigned long hardLagSum = 0;
-  uint32_t softImpactSum = 0;
-  uint32_t hardImpactSum = 0;
-  uint32_t softPowerSum = 0;
-  int softHits = 0;
-  int hardHits = 0;
-
-  for (int r = 0; r < repeats; ++r)
-  {
-    configureProbeStrike(mallet, hardPower);
-    StrikeMeasurement hard = measureStrikeResponse(mallet, kImpactThresholdHardRise, kCalibrationHardMaxLagMs, kHardMinRiseFloor);
-    Serial.print("    hard: ambient=");
-    Serial.print(hard.ambient);
-    Serial.print(" threshold=");
-    Serial.print(hard.triggerThreshold);
-    Serial.print(" rise=");
-    Serial.print(hard.peakRise);
-    Serial.print(" minRise=");
-    Serial.print(hard.minRiseRequired);
-    Serial.print(" noise=");
-    Serial.print(hard.noiseP2P);
-    Serial.print(" lag=");
-    Serial.print(hard.lagMs);
-    Serial.print(" hit=");
-    Serial.println(hard.impactDetected ? "yes" : "no");
-    if (hard.impactDetected)
-    {
-      hardImpactSum += static_cast<uint32_t>(hard.peakRise);
-      hardLagSum += hard.lagMs;
-      hardHits++;
-    }
-
-    serviceDelay(kCalibrationInterStrikeDelayMs);
-    waitForRingdown(kRingdownTimeoutMs);
-
-    unsigned long softMaxLagMs = kCalibrationSoftMaxLagFloorMs;
-    int32_t softMinRise = kSoftMinRiseFloor;
-    if (hard.impactDetected)
-    {
-      softMaxLagMs = hard.lagMs + kCalibrationSoftLagSlackMs;
-      if (softMaxLagMs < kCalibrationSoftMaxLagFloorMs)
-      {
-        softMaxLagMs = kCalibrationSoftMaxLagFloorMs;
-      }
-      const int32_t derivedSoftMinRise = hard.peakRise / kSoftMinRiseHardDivisor;
-      if (derivedSoftMinRise > softMinRise)
-      {
-        softMinRise = derivedSoftMinRise;
-      }
-    }
-
-    StrikeMeasurement soft = {};
-    uint16_t selectedSoftPower = softPower;
-    bool softAccepted = false;
-    for (int attempt = 0; attempt < kSoftPowerAttempts; ++attempt)
-    {
-      const uint16_t candidatePower = static_cast<uint16_t>(constrain(static_cast<int>(softPower) + (attempt * static_cast<int>(kSoftPowerStep)),
-                                                                       static_cast<int>(kSoftPowerInitial),
-                                                                       static_cast<int>(kSoftPowerMax)));
-      configureProbeStrike(mallet, candidatePower);
-      soft = measureStrikeResponse(mallet, kImpactThresholdSoftRise, softMaxLagMs, softMinRise);
-
-      Serial.print("    soft: pwr=");
-      Serial.print(candidatePower);
-      Serial.print(" ambient=");
-      Serial.print(soft.ambient);
-      Serial.print(" threshold=");
-      Serial.print(soft.triggerThreshold);
-      Serial.print(" rise=");
-      Serial.print(soft.peakRise);
-      Serial.print(" minRise=");
-      Serial.print(soft.minRiseRequired);
-      Serial.print(" noise=");
-      Serial.print(soft.noiseP2P);
-      Serial.print(" lag=");
-      Serial.print(soft.lagMs);
-      Serial.print(" hit=");
-      Serial.println(soft.impactDetected ? "yes" : "no");
-
-      if (soft.impactDetected)
-      {
-        selectedSoftPower = candidatePower;
-        softAccepted = true;
-        break;
-      }
-
-      serviceDelay(kCalibrationSoftRetryDelayMs);
-      waitForRingdown(kRingdownTimeoutMs);
-    }
-
-    if (softAccepted)
-    {
-      softPower = selectedSoftPower;
-      softPowerSum += static_cast<uint32_t>(selectedSoftPower);
-      softImpactSum += static_cast<uint32_t>(soft.peakRise);
-      softLagSum += soft.lagMs;
-      softHits++;
-    }
-
-    serviceDelay(kCalibrationInterStrikeDelayMs);
-    waitForRingdown(kRingdownTimeoutMs);
-  }
-
-  VelocityCalibrationModel model;
-  model.softPower = (softHits > 0) ? static_cast<uint16_t>(softPowerSum / softHits) : static_cast<uint16_t>(constrain(static_cast<int>(kSoftPowerInitial + (2 * kSoftPowerStep)), 250, static_cast<int>(hardPower)));
-  model.hardPower = hardPower;
-  model.hardLagMs = (hardHits > 0) ? static_cast<uint16_t>(hardLagSum / hardHits) : 320;
-  model.softLagMs = (softHits > 0) ? static_cast<uint16_t>(softLagSum / softHits) : static_cast<uint16_t>(model.hardLagMs + 80);
-  if (model.softLagMs < model.hardLagMs)
-  {
-    model.softLagMs = model.hardLagMs;
-  }
-
-  model.softImpact = softImpactSum / repeats;
-  model.hardImpact = hardImpactSum / repeats;
-  if (model.hardImpact <= model.softImpact)
-  {
-    model.hardImpact = model.softImpact + 1;
-  }
-
-  model.valid = (hardHits > 0);
-  gVelocityCalibration[index] = model;
-
-  const unsigned long defaultLag = static_cast<unsigned long>((static_cast<uint32_t>(model.softLagMs) + static_cast<uint32_t>(model.hardLagMs)) / 2UL);
-  mallet.setDelay(defaultLag);
-  applyMalletTimingFromLag(mallet, defaultLag);
-
-  Serial.print("  velocity: softLag=");
-  Serial.print(model.softLagMs);
-  Serial.print(" hardLag=");
-  Serial.print(model.hardLagMs);
-  Serial.print(" softImpact=");
-  Serial.print(model.softImpact);
-  Serial.print(" hardImpact=");
-  Serial.print(model.hardImpact);
-  Serial.print(" valid=");
-  Serial.println(model.valid ? "yes" : "no");
-
-  return model.valid;
+  Calibration::initializeDefaults(mallets, kMalletCount);
 }
 
 ScheduledStrike buildStrikeForVelocity(size_t malletIndex, uint8_t velocity)
 {
-  VelocityCalibrationModel model = gVelocityCalibration[malletIndex];
+  Mallet::CalibrationModel model = mallets[malletIndex].getCalibration();
   if (!model.valid)
   {
     setVelocityCalibrationDefaults(malletIndex);
-    model = gVelocityCalibration[malletIndex];
+    model = mallets[malletIndex].getCalibration();
   }
 
   const float velocityNorm = clamp01((static_cast<float>(velocity) - 1.0f) / 126.0f);
@@ -1021,471 +1084,87 @@ void scheduleNote(size_t malletIndex, unsigned long targetNoteMillis, uint8_t ve
   mallets[malletIndex].delayedTrigger(delayMs, strike.profile);
 }
 
-CalibrationEntry buildCalibrationEntry(size_t index)
-{
-  CalibrationEntry entry = {};
-  entry.midiPitch = static_cast<int16_t>(mallets[index].getMidiPitch());
-  entry.softPower = gVelocityCalibration[index].softPower;
-  entry.hardPower = gVelocityCalibration[index].hardPower;
-  entry.softLagMs = gVelocityCalibration[index].softLagMs;
-  entry.hardLagMs = gVelocityCalibration[index].hardLagMs;
-  entry.softImpact = gVelocityCalibration[index].softImpact;
-  entry.hardImpact = gVelocityCalibration[index].hardImpact;
-  entry.valid = gVelocityCalibration[index].valid ? 1 : 0;
-  return entry;
-}
-
-void applyCalibrationEntry(size_t index, const CalibrationEntry &entry)
-{
-  if (entry.valid != 0)
-  {
-    gVelocityCalibration[index].softPower = entry.softPower;
-    gVelocityCalibration[index].hardPower = entry.hardPower;
-    gVelocityCalibration[index].softLagMs = entry.softLagMs;
-    gVelocityCalibration[index].hardLagMs = entry.hardLagMs;
-    gVelocityCalibration[index].softImpact = entry.softImpact;
-    gVelocityCalibration[index].hardImpact = entry.hardImpact;
-    gVelocityCalibration[index].valid = true;
-  }
-  else
-  {
-    setVelocityCalibrationDefaults(index);
-  }
-
-  if (entry.midiPitch >= 0 && entry.midiPitch <= 127)
-  {
-    mallets[index].setMidiPitch(entry.midiPitch);
-  }
-
-  const unsigned long defaultLag = static_cast<unsigned long>((static_cast<uint32_t>(gVelocityCalibration[index].softLagMs) +
-                                    static_cast<uint32_t>(gVelocityCalibration[index].hardLagMs)) / 2UL);
-  mallets[index].setDelay(defaultLag);
-  applyMalletTimingFromLag(mallets[index], defaultLag);
-}
-
 bool saveCalibrationToEeprom()
 {
-  CalibrationHeader header = {};
-  EEPROM.get(kCalibrationHeaderAddress, header);
-
-  if (header.magic != kCalibrationMagic || header.version != kCalibrationVersion || header.malletCount != kMalletCount)
-  {
-    header.writeCount = 0;
-  }
-
-  header.magic = kCalibrationMagic;
-  header.version = kCalibrationVersion;
-  header.malletCount = kMalletCount;
-  header.writeCount += 1;
-
-  EEPROM.put(kCalibrationHeaderAddress, header);
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    const size_t address = kCalibrationEntriesAddress + (i * sizeof(CalibrationEntry));
-    CalibrationEntry entry = buildCalibrationEntry(i);
-    EEPROM.put(address, entry);
-  }
-
-  const bool committed = EEPROM.commit();
-  Serial.print("Saved calibration, writeCount=");
-  Serial.print(header.writeCount);
-  Serial.print(", status=");
-  Serial.println(committed ? "ok" : "failed");
-  return committed;
+  return Calibration::saveToEeprom(mallets, kMalletCount, Serial);
 }
 
 bool loadCalibrationFromEeprom()
 {
-  CalibrationHeader header = {};
-  EEPROM.get(kCalibrationHeaderAddress, header);
-
-  if (header.magic != kCalibrationMagic || header.version != kCalibrationVersion || header.malletCount != kMalletCount)
+  const bool loaded = Calibration::loadFromEeprom(mallets, kMalletCount, Serial);
+  if (!loaded)
   {
     return false;
   }
 
   for (size_t i = 0; i < kMalletCount; ++i)
   {
-    CalibrationEntry entry = {};
-    const size_t address = kCalibrationEntriesAddress + (i * sizeof(CalibrationEntry));
-    EEPROM.get(address, entry);
-    applyCalibrationEntry(i, entry);
+    const Mallet::CalibrationModel model = mallets[i].getCalibration();
+    const unsigned long defaultLag = Calibration::defaultLagFromModel(model);
+    mallets[i].setDelay(defaultLag);
+    applyMalletTimingFromLag(mallets[i], defaultLag);
   }
-
-  Serial.print("Loaded calibration from EEPROM writes: ");
-  Serial.println(header.writeCount);
   return true;
 }
 
 void printMalletStatus()
 {
-  Serial.println("Mallet status:");
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    Serial.print("  #");
-    Serial.print(i);
-    Serial.print(" pitch=");
-    Serial.print(mallets[i].getMidiPitch());
-    Serial.print(" lagSoft=");
-    Serial.print(gVelocityCalibration[i].softLagMs);
-    Serial.print(" lagHard=");
-    Serial.print(gVelocityCalibration[i].hardLagMs);
-    Serial.print(" pwrSoft=");
-    Serial.print(gVelocityCalibration[i].softPower);
-    Serial.print(" pwrHard=");
-    Serial.print(gVelocityCalibration[i].hardPower);
-    Serial.print(" impactSoft=");
-    Serial.print(gVelocityCalibration[i].softImpact);
-    Serial.print(" impactHard=");
-    Serial.print(gVelocityCalibration[i].hardImpact);
-    Serial.print(" valid=");
-    Serial.println(gVelocityCalibration[i].valid ? "yes" : "no");
-  }
-}
-
-void printAudioStatus()
-{
-  Serial.print("Audio filtered=");
-  Serial.print(gFilteredMic);
-  Serial.print(" peak=");
-  Serial.print(gDynamicMicPeak);
-  Serial.print(" norm=");
-  Serial.print(gNormalizedMic, 3);
-  Serial.print(" fftArmed=");
-  Serial.print(gFftCaptureArmed ? "yes" : "no");
-  Serial.print(" fftReady=");
-  Serial.print(gFftFrameReady ? "yes" : "no");
-  Serial.print(" fftHz=");
-  Serial.print(gFftDetectedHz, 2);
-  Serial.print(" fftMag=");
-  Serial.print(gFftDetectedMagnitude, 2);
-  Serial.print(" micCh=");
-  Serial.print((gMicChannelSelect == MIC_CHANNEL_RIGHT) ? "right" : "left");
-  Serial.print(" leftPk=");
-  Serial.print(gMicLeftPeak);
-  Serial.print(" rightPk=");
-  Serial.print(gMicRightPeak);
-  Serial.print(" dc=");
-  Serial.println(gMicDc);
-}
-
-void printMicDiagnostics()
-{
-  Serial.print("micdiag channel=");
-  Serial.print((gMicChannelSelect == MIC_CHANNEL_RIGHT) ? "right" : "left");
-  Serial.print(" gainShift=");
-  Serial.print(gMicGainShiftBits);
-  Serial.print(" decodeShift=");
-  Serial.print(kMicSlotTo24BitShiftBits);
-  Serial.print(" leftPeak=");
-  Serial.print(gMicLeftPeak);
-  Serial.print(" rightPeak=");
-  Serial.print(gMicRightPeak);
-  Serial.print(" filtered=");
-  Serial.print(gFilteredMic);
-  Serial.print(" dc=");
-  Serial.println(gMicDc);
-}
-
-void runMicProbe(const String &cmd)
-{
-  unsigned long windowMs = 400;
-  const int separator = cmd.indexOf(' ');
-  if (separator >= 0 && separator + 1 < static_cast<int>(cmd.length()))
-  {
-    const long parsed = cmd.substring(separator + 1).toInt();
-    if (parsed > 0)
-    {
-      windowMs = static_cast<unsigned long>(parsed);
-    }
-  }
-
-  if (windowMs < 100)
-  {
-    windowMs = 100;
-  }
-  if (windowMs > 3000)
-  {
-    windowMs = 3000;
-  }
-
-  gMicLeftPeak = 0;
-  gMicRightPeak = 0;
-
-  int32_t filteredMin = INT32_MAX;
-  int32_t filteredMax = INT32_MIN;
-  int32_t dcMin = INT32_MAX;
-  int32_t dcMax = INT32_MIN;
-  float normMax = 0.0f;
-
-  const unsigned long start = millis();
-  while (millis() - start < windowMs)
-  {
-    const int32_t filtered = gFilteredMic;
-    const int32_t dc = gMicDc;
-    const float norm = gNormalizedMic;
-
-    if (filtered < filteredMin)
-    {
-      filteredMin = filtered;
-    }
-    if (filtered > filteredMax)
-    {
-      filteredMax = filtered;
-    }
-    if (dc < dcMin)
-    {
-      dcMin = dc;
-    }
-    if (dc > dcMax)
-    {
-      dcMax = dc;
-    }
-    if (norm > normMax)
-    {
-      normMax = norm;
-    }
-
-    updateMallets();
-    delay(1);
-  }
-
-  const int32_t filteredP2P = (filteredMax > filteredMin) ? (filteredMax - filteredMin) : 0;
-
-  Serial.print("micprobe ms=");
-  Serial.print(windowMs);
-  Serial.print(" ch=");
-  Serial.print((gMicChannelSelect == MIC_CHANNEL_RIGHT) ? "right" : "left");
-  Serial.print(" leftPeak=");
-  Serial.print(gMicLeftPeak);
-  Serial.print(" rightPeak=");
-  Serial.print(gMicRightPeak);
-  Serial.print(" filtMin=");
-  Serial.print(filteredMin);
-  Serial.print(" filtMax=");
-  Serial.print(filteredMax);
-  Serial.print(" filtP2P=");
-  Serial.print(filteredP2P);
-  Serial.print(" dcMin=");
-  Serial.print(dcMin);
-  Serial.print(" dcMax=");
-  Serial.print(dcMax);
-  Serial.print(" normMax=");
-  Serial.println(normMax, 3);
-}
-
-void setMicChannelFromCommand(const String &cmd)
-{
-  int channel = -1;
-  if (cmd == "micch left" || cmd == "micch l" || cmd == "micch 0")
-  {
-    channel = MIC_CHANNEL_LEFT;
-  }
-  else if (cmd == "micch right" || cmd == "micch r" || cmd == "micch 1")
-  {
-    channel = MIC_CHANNEL_RIGHT;
-  }
-
-  if (channel < 0)
-  {
-    Serial.println("micch usage: micch left|right (or 0|1)");
-    return;
-  }
-
-  gMicChannelSelect = channel;
-  Serial.print("Mic channel set to ");
-  Serial.println((gMicChannelSelect == MIC_CHANNEL_RIGHT) ? "right" : "left");
-}
-
-void setMicShiftFromCommand(const String &cmd)
-{
-  const int separator = cmd.indexOf(' ');
-  if (separator < 0 || separator + 1 >= static_cast<int>(cmd.length()))
-  {
-    Serial.print("micshift usage: micshift <0..");
-    Serial.print(kMicGainShiftMaxBits);
-    Serial.println(">");
-    return;
-  }
-
-  int shift = cmd.substring(separator + 1).toInt();
-  if (shift < 0)
-  {
-    shift = 0;
-  }
-  if (shift > kMicGainShiftMaxBits)
-  {
-    shift = kMicGainShiftMaxBits;
-  }
-
-  gMicGainShiftBits = shift;
-  gMicLeftPeak = 0;
-  gMicRightPeak = 0;
-  gMicDc = 0;
-  Serial.print("Mic gain shift set to ");
-  Serial.print(gMicGainShiftBits);
-  Serial.print(" (24-bit decode shift fixed at ");
-  Serial.print(kMicSlotTo24BitShiftBits);
-  Serial.println(")");
+  Calibration::printStatus(mallets, kMalletCount, Serial);
 }
 
 void runFftTestForMallet(int index)
 {
-  if (index < 0 || index >= static_cast<int>(kMalletCount))
-  {
-    Serial.print("ffttest mallet index out of range 0..");
-    Serial.println(static_cast<int>(kMalletCount) - 1);
-    return;
-  }
-
-  const size_t malletIndex = static_cast<size_t>(index);
-  Mallet &mallet = mallets[malletIndex];
-  configurePitchProbeStrike(mallet, gVelocityCalibration[malletIndex]);
-  waitForRingdown(kRingdownTimeoutMs);
-  serviceDelay(kCalibrationInterStrikeDelayMs);
-
-  float detectedHz = 0.0f;
-  float detectedMagnitude = 0.0f;
-  unsigned long captureDelayMs = 120;
-  if (gVelocityCalibration[malletIndex].valid)
-  {
-    captureDelayMs = static_cast<unsigned long>(gVelocityCalibration[malletIndex].hardLagMs + kPitchCaptureOffsetMs);
-  }
-  const int detectedPitch = detectPitchFromStrike(mallet, captureDelayMs, &detectedHz, &detectedMagnitude);
-
-  Serial.print("ffttest mallet=");
-  Serial.print(index);
-  Serial.print(" hz=");
-  Serial.print(detectedHz, 2);
-  Serial.print(" mag=");
-  Serial.print(detectedMagnitude, 2);
-  Serial.print(" midi=");
-  Serial.println(detectedPitch);
+  CalibrationRuntime::runFftTestForMallet(index);
 }
 
 void playCalibrationArpeggio()
 {
-  Serial.println("Calibration arpeggio");
-  size_t order[kMalletCount] = {};
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    order[i] = i;
-  }
-
-  // Sort mallets by detected MIDI pitch so arpeggio is truly by pitch.
-  for (size_t i = 0; i + 1 < kMalletCount; ++i)
-  {
-    size_t best = i;
-    for (size_t j = i + 1; j < kMalletCount; ++j)
-    {
-      if (mallets[order[j]].getMidiPitch() < mallets[order[best]].getMidiPitch())
-      {
-        best = j;
-      }
-    }
-    if (best != i)
-    {
-      const size_t tmp = order[i];
-      order[i] = order[best];
-      order[best] = tmp;
-    }
-  }
-
-  auto playArpStep = [&](size_t malletIndex) {
-    Mallet &mallet = mallets[malletIndex];
-    waitForMalletIdle(mallet, kCalibrationMalletIdleTimeoutMs);
-
-    const uint16_t power = gVelocityCalibration[malletIndex].valid ? gVelocityCalibration[malletIndex].softPower : 700;
-    configureProbeStrike(mallet, power);
-    mallet.triggerMallet();
-
-    Serial.print("  arp #");
-    Serial.print(malletIndex);
-    Serial.print(" midi=");
-    Serial.println(mallet.getMidiPitch());
-
-    serviceDelay(kCalibrationInterMalletDelayMs);
-  };
-
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    playArpStep(order[i]);
-  }
-
-  for (int i = static_cast<int>(kMalletCount) - 2; i >= 0; --i)
-  {
-    playArpStep(order[static_cast<size_t>(i)]);
-  }
+  CalibrationRuntime::playCalibrationArpeggio();
 }
 
 void runVelocityCalibrationOnly()
 {
-  gCalibrationInProgress = true;
-  prepareMalletsForCalibration();
-  Serial.println("Starting velocity calibration");
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    mallets[i].abortAndClearQueue();
-    Serial.print("Calibrating velocity for mallet #");
-    Serial.println(i);
-    calibrateVelocityForMallet(i);
-    waitForRingdown(kRingdownTimeoutMs);
-    serviceDelay(kCalibrationInterMalletDelayMs);
-  }
-  saveCalibrationToEeprom();
-  printMalletStatus();
-  Serial.println("Velocity calibration complete");
-  prepareMalletsForCalibration();
-  gCalibrationInProgress = false;
+  CalibrationRuntime::runVelocityCalibrationOnly();
 }
 
 void runFullCalibration()
 {
-  gCalibrationInProgress = true;
-  prepareMalletsForCalibration();
-  Serial.println("Starting full calibration");
+  CalibrationRuntime::runFullCalibration();
+}
 
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    mallets[i].abortAndClearQueue();
-    Serial.print("Calibrating mallet #");
-    Serial.println(i);
+void runFullCalibrationForMallet(size_t index)
+{
+  CalibrationRuntime::runFullCalibrationForMallet(index);
+}
 
-    calibrateVelocityForMallet(i);
+void printAudioStatus()
+{
+  AudioDiagnostics::printAudioStatus();
+}
 
-    // Detect pitch using calibrated hard-strike timing/power.
-    configurePitchProbeStrike(mallets[i], gVelocityCalibration[i]);
-    waitForRingdown(kRingdownTimeoutMs);
-    serviceDelay(kCalibrationInterStrikeDelayMs);
+void printMicDiagnostics()
+{
+  AudioDiagnostics::printMicDiagnostics();
+}
 
-    float detectedHz = 0.0f;
-    float detectedMagnitude = 0.0f;
-    unsigned long captureDelayMs = static_cast<unsigned long>(gVelocityCalibration[i].hardLagMs + kPitchCaptureOffsetMs);
-    const int detectedPitch = detectPitchFromStrike(mallets[i], captureDelayMs, &detectedHz, &detectedMagnitude);
-    if (detectedPitch >= 0)
-    {
-      mallets[i].setMidiPitch(detectedPitch);
-    }
+void runMicProbe(const String &cmd)
+{
+  AudioDiagnostics::runMicProbe(cmd);
+}
 
-    Serial.print("  pitchHz=");
-    Serial.print(detectedHz);
-    Serial.print(" mag=");
-    Serial.print(detectedMagnitude);
-    Serial.print(" detected=");
-    Serial.print(detectedPitch);
-    Serial.print(" midi=");
-    Serial.println(mallets[i].getMidiPitch());
+void setMicChannelFromCommand(const String &cmd)
+{
+  AudioDiagnostics::setMicChannelFromCommand(cmd);
+}
 
-    waitForRingdown(kRingdownTimeoutMs);
-    serviceDelay(kCalibrationInterMalletDelayMs);
-  }
+void setMicShiftFromCommand(const String &cmd)
+{
+  AudioDiagnostics::setMicShiftFromCommand(cmd);
+}
 
-  playCalibrationArpeggio();
-  saveCalibrationToEeprom();
-  printMalletStatus();
-  Serial.println("Full calibration complete");
-  prepareMalletsForCalibration();
-  gCalibrationInProgress = false;
+void setMicModeFromCommand(const String &cmd)
+{
+  AudioDiagnostics::setMicModeFromCommand(cmd);
 }
 
 void setMalletMidiFromCommand(const String &cmd)
@@ -1540,56 +1219,22 @@ void handleSerialCommands()
   }
 
   const String command = Serial.readStringUntil('\n');
-  String cmd = command;
-  cmd.trim();
-  cmd.toLowerCase();
-
-  if (cmd == "cal")
-  {
-    runFullCalibration();
-  }
-  else if (cmd == "calvel")
-  {
-    runVelocityCalibrationOnly();
-  }
-  else if (cmd == "status")
-  {
-    printMalletStatus();
-  }
-  else if (cmd == "audiostatus")
-  {
-    printAudioStatus();
-  }
-  else if (cmd == "micdiag")
-  {
-    printMicDiagnostics();
-  }
-  else if (cmd.startsWith("micprobe"))
-  {
-    runMicProbe(cmd);
-  }
-  else if (cmd.startsWith("micch"))
-  {
-    setMicChannelFromCommand(cmd);
-  }
-  else if (cmd.startsWith("micshift"))
-  {
-    setMicShiftFromCommand(cmd);
-  }
-  else if (cmd.startsWith("ffttest"))
-  {
-    int malletIndex = 0;
-    const int separator = cmd.indexOf(' ');
-    if (separator >= 0 && separator + 1 < static_cast<int>(cmd.length()))
-    {
-      malletIndex = cmd.substring(separator + 1).toInt();
-    }
-    runFftTestForMallet(malletIndex);
-  }
-  else if (cmd.startsWith("setnote"))
-  {
-    setMalletMidiFromCommand(cmd);
-  }
+  const SerialCommands::Handlers handlers = {
+    playCalibrationArpeggio,
+    runFullCalibration,
+    runFullCalibrationForMallet,
+    runVelocityCalibrationOnly,
+    printMalletStatus,
+    printAudioStatus,
+    printMicDiagnostics,
+    runMicProbe,
+    setMicChannelFromCommand,
+    setMicShiftFromCommand,
+    setMicModeFromCommand,
+    runFftTestForMallet,
+    setMalletMidiFromCommand,
+  };
+  SerialCommands::dispatch(command, handlers, kMalletCount, Serial);
 }
 
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint16_t timestamp)
@@ -1635,6 +1280,83 @@ void setup()
   initializeVelocityCalibrationDefaults();
   setupAudioCapture();
 
+  CalibrationRuntime::Config calibrationConfig = {};
+  calibrationConfig.calibrationImpactTimeoutMs = kCalibrationImpactTimeoutMs;
+  calibrationConfig.calibrationMalletIdleTimeoutMs = kCalibrationMalletIdleTimeoutMs;
+  calibrationConfig.impactDetectGuardMs = kImpactDetectGuardMs;
+  calibrationConfig.calibrationHardMaxLagMs = kCalibrationHardMaxLagMs;
+  calibrationConfig.calibrationSoftLagSlackMs = kCalibrationSoftLagSlackMs;
+  calibrationConfig.calibrationSoftMaxLagFloorMs = kCalibrationSoftMaxLagFloorMs;
+  calibrationConfig.ringdownTimeoutMs = kRingdownTimeoutMs;
+  calibrationConfig.ringdownStableMs = kRingdownStableMs;
+  calibrationConfig.pitchCaptureOffsetMs = kPitchCaptureOffsetMs;
+  calibrationConfig.calibrationInterStrikeDelayMs = kCalibrationInterStrikeDelayMs;
+  calibrationConfig.calibrationInterMalletDelayMs = kCalibrationInterMalletDelayMs;
+  calibrationConfig.calibrationSoftRetryDelayMs = kCalibrationSoftRetryDelayMs;
+  calibrationConfig.calibrationRepeats = kCalibrationRepeats;
+  calibrationConfig.impactThresholdHardRise = kImpactThresholdHardRise;
+  calibrationConfig.impactThresholdSoftRise = kImpactThresholdSoftRise;
+  calibrationConfig.ringdownThresholdRise = kRingdownThresholdRise;
+  calibrationConfig.impactThresholdHysteresis = kImpactThresholdHysteresis;
+  calibrationConfig.impactNoiseRiseFloor = kImpactNoiseRiseFloor;
+  calibrationConfig.impactNoiseMultiplier = kImpactNoiseMultiplier;
+  calibrationConfig.hardMinRiseFloor = kHardMinRiseFloor;
+  calibrationConfig.softMinRiseFloor = kSoftMinRiseFloor;
+  calibrationConfig.softMinRiseHardDivisor = kSoftMinRiseHardDivisor;
+  calibrationConfig.softPowerInitial = kSoftPowerInitial;
+  calibrationConfig.softPowerStep = kSoftPowerStep;
+  calibrationConfig.softPowerMax = kSoftPowerMax;
+  calibrationConfig.softPowerAttempts = kSoftPowerAttempts;
+
+  CalibrationRuntime::Callbacks calibrationCallbacks = {};
+  calibrationCallbacks.updateMallets = updateMallets;
+  calibrationCallbacks.serviceDelay = serviceDelay;
+  calibrationCallbacks.detectPitchFromStrike = detectPitchFromStrike;
+  calibrationCallbacks.scheduleNote = scheduleNote;
+  calibrationCallbacks.saveCalibrationToEeprom = saveCalibrationToEeprom;
+  calibrationCallbacks.printMalletStatus = printMalletStatus;
+  calibrationCallbacks.prepareMalletsForCalibration = prepareMalletsForCalibration;
+
+  CalibrationRuntime::Dependencies calibrationDeps = {};
+  calibrationDeps.mallets = mallets;
+  calibrationDeps.malletCount = kMalletCount;
+  calibrationDeps.filteredMic = &gFilteredMic;
+  calibrationDeps.calibrationInProgress = &gCalibrationInProgress;
+  calibrationDeps.log = &Serial;
+  calibrationDeps.config = calibrationConfig;
+  calibrationDeps.callbacks = calibrationCallbacks;
+  CalibrationRuntime::initialize(calibrationDeps);
+
+  AudioDiagnostics::Dependencies audioDeps = {};
+  audioDeps.filteredMic = &gFilteredMic;
+  audioDeps.dynamicMicPeak = &gDynamicMicPeak;
+  audioDeps.normalizedMic = &gNormalizedMic;
+  audioDeps.fftCaptureArmed = &gFftCaptureArmed;
+  audioDeps.fftFrameReady = &gFftFrameReady;
+  audioDeps.fftDetectedHz = &gFftDetectedHz;
+  audioDeps.fftDetectedMagnitude = &gFftDetectedMagnitude;
+  audioDeps.fftAutocorrHz = &gFftAutocorrHz;
+  audioDeps.fftAutocorrCorrelation = &gFftAutocorrCorrelation;
+  audioDeps.fftMeasuredSampleRateHz = &gFftMeasuredSampleRateHz;
+  audioDeps.fftAnalysisSampleRateHz = &gFftAnalysisSampleRateHz;
+  audioDeps.micChannelSelect = &gMicChannelSelect;
+  audioDeps.micSampleMode = &gMicSampleMode;
+  audioDeps.usingStereoSamplePairs = &gUsingStereoSamplePairs;
+  audioDeps.micLeftPeak = &gMicLeftPeak;
+  audioDeps.micRightPeak = &gMicRightPeak;
+  audioDeps.micDc = &gMicDc;
+  audioDeps.micGainShiftBits = &gMicGainShiftBits;
+  audioDeps.micChannelLeftValue = MIC_CHANNEL_LEFT;
+  audioDeps.micChannelRightValue = MIC_CHANNEL_RIGHT;
+  audioDeps.micSampleModeAutoValue = MIC_SAMPLE_MODE_AUTO;
+  audioDeps.micSampleModeStereoValue = MIC_SAMPLE_MODE_STEREO_PAIRS;
+  audioDeps.micSampleModeMonoValue = MIC_SAMPLE_MODE_MONO_STREAM;
+  audioDeps.micGainShiftMaxBits = kMicGainShiftMaxBits;
+  audioDeps.micSlotTo24BitShiftBits = kMicSlotTo24BitShiftBits;
+  audioDeps.updateMallets = updateMallets;
+  audioDeps.log = &Serial;
+  AudioDiagnostics::initialize(audioDeps);
+
   bool loaded = loadCalibrationFromEeprom();
   if (!loaded && kRunSelfCalibrationOnBootWhenMissing)
   {
@@ -1668,9 +1390,9 @@ void setup()
   BLEMidiServer.setNoteOffCallback(handleNoteOff);
 
   Serial.println("RobotDrum ready");
-  Serial.print("Serial commands: status, cal, calvel, setnote <idx> <midi>, audiostatus, micdiag, micprobe [ms], micch left|right, micshift <0..");
+  Serial.print("Serial commands: status, cal [idx], calvel, arp, setnote <idx> <midi>, audiostatus, micdiag, micprobe [ms], micch left|right, micshift <0..");
   Serial.print(kMicGainShiftMaxBits);
-  Serial.println(">, ffttest [index]");
+  Serial.println(">, micmode auto|stereo|mono, ffttest [index]");
 }
 
 void loop()
