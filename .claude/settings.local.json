@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cd /c/Users/mmsyl/Documents/RobotDrum && ~/.platformio/penv/Scripts/pio run 2>&1)"
+      "Bash(cd /c/Users/mmsyl/Documents/RobotDrum && ~/.platformio/penv/Scripts/pio run 2>&1)",
+      "Bash(xargs grep:*)"
     ]
   }
 }

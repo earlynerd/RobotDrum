@@ -2,6 +2,7 @@
 
 namespace
 {
+// Unsigned millis() comparisons that handle rollover correctly.
 bool timeReached(unsigned long now, unsigned long target)
 {
   return static_cast<long>(now - target) >= 0;
@@ -29,9 +30,48 @@ Mallet::Mallet(int pin, int MIDIpitch, int malletChannel, int strikePWM, int str
 void Mallet::begin()
 {
   ledcAttachPin(malletPin, channel);
-  ledcSetup(channel, 18000, 10);
+  ledcSetup(channel, 18000, 10);  // 18 kHz PWM, 10-bit resolution
 }
 
+// Build a simple 3-segment profile from the legacy member variables.
+// This is the compatibility path for calibration code that sets
+// strikePower/Duration etc. directly rather than building a full
+// shaped profile.
+Mallet::StrikeProfile Mallet::buildProfileFromMembers() const
+{
+  StrikeProfile profile = {};
+  profile.count = 0;
+
+  if (strikeDuration > 0)
+  {
+    profile.segments[profile.count++] = {
+      static_cast<uint16_t>(constrain(strikePower, 0, 1023)),
+      static_cast<uint16_t>(strikeDuration)
+    };
+  }
+
+  if (coastDuration > 0)
+  {
+    profile.segments[profile.count++] = {
+      static_cast<uint16_t>(constrain(coastPower, 0, 1023)),
+      static_cast<uint16_t>(coastDuration)
+    };
+  }
+
+  if (reboundDuration > 0)
+  {
+    profile.segments[profile.count++] = {
+      static_cast<uint16_t>(constrain(reboundPower, 0, 1023)),
+      static_cast<uint16_t>(reboundDuration)
+    };
+  }
+
+  return profile;
+}
+
+// Core state machine — called every loop() iteration for each mallet.
+// Walks through the active profile's segments sequentially, setting PWM
+// power for each segment's duration, then returns to idle.
 void Mallet::updateMallet()
 {
   handleQueuedStrikes();
@@ -43,28 +83,38 @@ void Mallet::updateMallet()
 
   case TRIGGER:
     triggerTime = millis();
-    malletState = STRIKE;
-    break;
-
-  case STRIKE:
-    ledcWrite(channel, strikePower);
-    if (millis() >= (triggerTime + strikeDuration))
-      malletState = COAST;
-    break;
-
-  case COAST:
-    ledcWrite(channel, coastPower);
-    if (millis() >= (triggerTime + strikeDuration + coastDuration))
-      malletState = REBOUND;
-    break;
-
-  case REBOUND:
-    ledcWrite(channel, reboundPower);
-    if (millis() >= (triggerTime + strikeDuration + coastDuration + reboundDuration))
+    activeSegment = 0;
+    if (activeProfile.count > 0)
+    {
+      segmentEndMillis = triggerTime + activeProfile.segments[0].durationMs;
+      malletState = ACTIVE;
+    }
+    else
     {
       ledcWrite(channel, 0);
       lastCycleEndMillis = millis();
       malletState = IDLESTATE;
+    }
+    break;
+
+  case ACTIVE:
+    if (activeSegment >= activeProfile.count)
+    {
+      ledcWrite(channel, 0);
+      lastCycleEndMillis = millis();
+      malletState = IDLESTATE;
+      break;
+    }
+    ledcWrite(channel, activeProfile.segments[activeSegment].power);
+    if (millis() >= segmentEndMillis)
+    {
+      activeSegment++;
+      if (activeSegment < activeProfile.count)
+      {
+        // Accumulate rather than re-read millis() so segment durations
+        // don't drift from loop latency.
+        segmentEndMillis += activeProfile.segments[activeSegment].durationMs;
+      }
     }
     break;
 
@@ -75,8 +125,11 @@ void Mallet::updateMallet()
   }
 }
 
+// Immediate trigger using legacy member params (used by calibration).
 void Mallet::triggerMallet()
 {
+  activeProfile = buildProfileFromMembers();
+  activeSegment = 0;
   malletState = TRIGGER;
 }
 
@@ -114,20 +167,16 @@ void Mallet::abortAndClearQueue()
   ledcWrite(channel, 0);
 }
 
-//add queued strike to the buffer for future trigger with nonblocking delay
+// Queue a strike for future execution using the legacy member params.
 void Mallet::delayedTrigger(unsigned long delayTime)
 {
-  StrikeProfile profile = {
-    strikePower,
-    strikeDuration,
-    coastPower,
-    coastDuration,
-    reboundPower,
-    reboundDuration
-  };
-  delayedTrigger(delayTime, profile);
+  delayedTrigger(delayTime, buildProfileFromMembers());
 }
 
+// Queue a strike with a pre-built shaped profile. The profile is stored
+// in a ring buffer and dequeued by handleQueuedStrikes() when its
+// scheduled time arrives. Called from the BLE MIDI callback (Core 0)
+// with the spinlock protecting concurrent access.
 void Mallet::delayedTrigger(unsigned long delayTime, const StrikeProfile &profile)
 {
   portENTER_CRITICAL(&queueMux);
@@ -152,7 +201,10 @@ void Mallet::delayedTrigger(unsigned long delayTime, const StrikeProfile &profil
   portEXIT_CRITICAL(&queueMux);
 }
 
-//check if any queued strikes should be triggered. do so, and remove from buffer
+// Dequeue the oldest ready strike and begin executing it. Picks the
+// earliest-scheduled entry that has reached its trigger time. Enforces
+// a minimum gap between strike cycles to prevent retriggering before
+// the mallet has settled.
 void Mallet::handleQueuedStrikes()
 {
   portENTER_CRITICAL(&queueMux);
@@ -175,6 +227,7 @@ void Mallet::handleQueuedStrikes()
     return;
   }
 
+  // Find the oldest queued strike whose time has arrived.
   int candidate = -1;
   unsigned long candidateTime = 0;
 
@@ -200,14 +253,14 @@ void Mallet::handleQueuedStrikes()
   const uint16_t selected = static_cast<uint16_t>(candidate);
   if (delayedStrikeHasProfile[selected])
   {
-    strikePower = delayedStrikeProfiles[selected].strikePower;
-    strikeDuration = delayedStrikeProfiles[selected].strikeDuration;
-    coastPower = delayedStrikeProfiles[selected].coastPower;
-    coastDuration = delayedStrikeProfiles[selected].coastDuration;
-    reboundPower = delayedStrikeProfiles[selected].reboundPower;
-    reboundDuration = delayedStrikeProfiles[selected].reboundDuration;
+    activeProfile = delayedStrikeProfiles[selected];
+  }
+  else
+  {
+    activeProfile = buildProfileFromMembers();
   }
 
+  activeSegment = 0;
   malletState = TRIGGER;
   delayedStrikeTriggerTimes[selected] = 0;
   delayedStrikeHasProfile[selected] = false;

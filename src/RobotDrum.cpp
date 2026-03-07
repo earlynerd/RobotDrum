@@ -155,6 +155,17 @@ float gFftWindow[kFftLength];
 bool gFftWindowReady = false;
 fft_config_t *gFftPlan = nullptr;
 
+// Loop timing instrumentation. Measures the period between consecutive
+// loop() calls to characterize update rate and jitter. The histogram
+// reveals whether any loop iterations are stalled (e.g. by FFT or BLE).
+// Use the "loopstats" serial command to print and reset.
+unsigned long gLoopLastMicros = 0;
+uint32_t gLoopCount = 0;
+uint32_t gLoopMinUs = UINT32_MAX;
+uint32_t gLoopMaxUs = 0;
+uint64_t gLoopSumUs = 0;
+uint32_t gLoopHistBuckets[6] = {};  // <50, 50-100, 100-500, 500-1000, 1000-5000, >5000 us
+
 i2s_config_t gI2sConfig = {
     .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = kSampleRateHz,
@@ -199,6 +210,67 @@ int32_t emaFilter(int32_t input, int32_t average, uint16_t integerAlpha)
   const int64_t blended = (static_cast<int64_t>(input) * integerAlpha) +
                           (static_cast<int64_t>(average) * (65536 - integerAlpha));
   return static_cast<int32_t>((blended + 32768) / 65536);
+}
+
+void trackLoopTiming()
+{
+  const unsigned long now = micros();
+  if (gLoopLastMicros != 0)
+  {
+    const uint32_t delta = static_cast<uint32_t>(now - gLoopLastMicros);
+    gLoopCount++;
+    gLoopSumUs += delta;
+    if (delta < gLoopMinUs) gLoopMinUs = delta;
+    if (delta > gLoopMaxUs) gLoopMaxUs = delta;
+
+    if (delta < 50)        gLoopHistBuckets[0]++;
+    else if (delta < 100)  gLoopHistBuckets[1]++;
+    else if (delta < 500)  gLoopHistBuckets[2]++;
+    else if (delta < 1000) gLoopHistBuckets[3]++;
+    else if (delta < 5000) gLoopHistBuckets[4]++;
+    else                   gLoopHistBuckets[5]++;
+  }
+  gLoopLastMicros = now;
+}
+
+void printLoopStats()
+{
+  if (gLoopCount == 0)
+  {
+    Serial.println("loopstats: no data yet");
+    return;
+  }
+
+  const uint32_t avgUs = static_cast<uint32_t>(gLoopSumUs / gLoopCount);
+  Serial.print("loopstats: n=");
+  Serial.print(gLoopCount);
+  Serial.print(" min=");
+  Serial.print(gLoopMinUs);
+  Serial.print("us avg=");
+  Serial.print(avgUs);
+  Serial.print("us max=");
+  Serial.print(gLoopMaxUs);
+  Serial.println("us");
+
+  Serial.print("  <50us=");
+  Serial.print(gLoopHistBuckets[0]);
+  Serial.print(" 50-100us=");
+  Serial.print(gLoopHistBuckets[1]);
+  Serial.print(" 100-500us=");
+  Serial.print(gLoopHistBuckets[2]);
+  Serial.print(" 0.5-1ms=");
+  Serial.print(gLoopHistBuckets[3]);
+  Serial.print(" 1-5ms=");
+  Serial.print(gLoopHistBuckets[4]);
+  Serial.print(" >5ms=");
+  Serial.println(gLoopHistBuckets[5]);
+
+  // Reset
+  gLoopCount = 0;
+  gLoopMinUs = UINT32_MAX;
+  gLoopMaxUs = 0;
+  gLoopSumUs = 0;
+  for (int i = 0; i < 6; i++) gLoopHistBuckets[i] = 0;
 }
 
 void updateMallets()
@@ -611,7 +683,9 @@ void serviceFftAnalysis()
   if (gFftFramePending && !gFftFrameReady)
   {
     gFftFramePending = false;
+    updateMallets();
     executeFftFrame();
+    updateMallets();
   }
 }
 
@@ -1074,6 +1148,38 @@ void initializeVelocityCalibrationDefaults()
   Calibration::initializeDefaults(mallets, kMalletCount);
 }
 
+// Build a shaped multi-segment strike profile for a given MIDI velocity.
+//
+// Uses the two-point calibration model (soft/hard power and lag) to
+// interpolate all timing and power parameters for the requested velocity.
+// The profile has three phases, inspired by input shaping in motion control:
+//
+//   1. STRIKE (ramp + hold): Drive the mallet toward the drum.
+//      - 2-step ramp (1/3 → 2/3 → full power over 10ms) softens the
+//        motor turn-on transient that would otherwise produce an audible
+//        click from the sudden current spike.
+//      - Hold at full power through drum contact. strikeDuration extends
+//        ~50% beyond the calibrated lag time so the mallet maintains
+//        contact pressure briefly.
+//
+//   2. COAST: Motor off for a short period (~10% of lag) around impact.
+//      Allows the mallet to separate from the drum before braking begins.
+//
+//   3. REBOUND BRAKE (tapered): Resist the spring return to prevent
+//      overshoot and bumpstop impact. Since the motor can only push
+//      toward the drum, forward torque during the return swing opposes
+//      the mallet's motion (braking). The taper is front-loaded:
+//        - 40% of duration at full brake power (catching peak velocity)
+//        - 30% at 40% power (mallet decelerating)
+//        - 30% at 12% power (light touch as mallet approaches rest)
+//      This lets the spring carry the mallet gently home rather than
+//      fighting sustained braking and then snapping when it releases.
+//
+// All durations are derived from the calibrated lag time (the measured
+// time from energize to drum contact). The lag approximates a quarter-
+// period of the mallet's natural oscillation (spring-mass system), so
+// the full natural period T ≈ 4 × lag, and the return half-swing takes
+// roughly 2 × lag — which is why reboundDuration ≈ 1.4 × lag.
 ScheduledStrike buildStrikeForVelocity(size_t malletIndex, uint8_t velocity)
 {
   Mallet::CalibrationModel model = mallets[malletIndex].getCalibration();
@@ -1083,27 +1189,96 @@ ScheduledStrike buildStrikeForVelocity(size_t malletIndex, uint8_t velocity)
     model = mallets[malletIndex].getCalibration();
   }
 
+  // Map MIDI velocity (1-127) to a 0-1 range with a slight power curve
+  // so the lower velocities have finer dynamic control.
   const float velocityNorm = clamp01((static_cast<float>(velocity) - 1.0f) / 126.0f);
   const float shaped = powf(velocityNorm, 1.25f);
 
+  // Interpolate between the soft and hard calibration endpoints.
   const float lagF = lerp(static_cast<float>(model.softLagMs), static_cast<float>(model.hardLagMs), shaped);
   const float powerF = lerp(static_cast<float>(model.softPower), static_cast<float>(model.hardPower), shaped);
 
+  const int strikePwr = constrain(static_cast<int>(lroundf(powerF)), 250, 1023);
+  const int totalStrikeDur = constrain(static_cast<int>(lroundf((lagF * 1.50f) + ((1.0f - shaped) * 120.0f))), 60, 600);
+  const int coastDur = constrain(static_cast<int>(lroundf(lagF * 0.10f)), 0, 300);
+  const int reboundPwr = constrain(static_cast<int>(lroundf(70.0f + (90.0f * shaped))), 40, 160);
+  const int totalReboundDur = constrain(static_cast<int>(lroundf((lagF * 1.40f) + ((1.0f - shaped) * 90.0f))), 30, 300);
+
   ScheduledStrike strike = {};
   strike.lagMs = static_cast<unsigned long>(lagF);
+  Mallet::StrikeProfile &prof = strike.profile;
+  prof.count = 0;
 
-  strike.profile.strikePower = constrain(static_cast<int>(lroundf(powerF)), 250, 1023);
-  strike.profile.strikeDuration = constrain(static_cast<int>(lroundf((lagF * 1.50f) + ((1.0f - shaped) * 120.0f))), 60, 600);
-  strike.profile.coastPower = 0;
-  strike.profile.coastDuration = constrain(static_cast<int>(lroundf(lagF * 0.10f)), 0, 300);
+  // Phase 1: Strike ramp + hold
+  constexpr int kRampStepMs = 5;
+  constexpr int kRampSteps = 2;
+  const int rampMs = kRampSteps * kRampStepMs;
+  if (totalStrikeDur > rampMs + 10)
+  {
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(strikePwr / 3),
+      static_cast<uint16_t>(kRampStepMs)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>((strikePwr * 2) / 3),
+      static_cast<uint16_t>(kRampStepMs)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(strikePwr),
+      static_cast<uint16_t>(totalStrikeDur - rampMs)
+    };
+  }
+  else
+  {
+    // Strike too short for ramp — go straight to full power.
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(strikePwr),
+      static_cast<uint16_t>(totalStrikeDur)
+    };
+  }
 
-  // Keep positive rebound torque so the actuator actively catches the return.
-  strike.profile.reboundPower = constrain(static_cast<int>(lroundf(70.0f + (90.0f * shaped))), 40, 160);
-  strike.profile.reboundDuration = constrain(static_cast<int>(lroundf((lagF * 1.40f) + ((1.0f - shaped) * 90.0f))), 30, 300);
+  // Phase 2: Coast at impact
+  if (coastDur > 0)
+  {
+    prof.segments[prof.count++] = {
+      0,
+      static_cast<uint16_t>(coastDur)
+    };
+  }
+
+  // Phase 3: Tapered rebound brake
+  if (totalReboundDur > 6 && prof.count + 3 <= Mallet::kMaxStrikeSegments)
+  {
+    const int seg1Dur = (totalReboundDur * 2) / 5;
+    const int seg2Dur = (totalReboundDur * 3) / 10;
+    const int seg3Dur = totalReboundDur - seg1Dur - seg2Dur;
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(reboundPwr),
+      static_cast<uint16_t>(seg1Dur)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>((reboundPwr * 2) / 5),
+      static_cast<uint16_t>(seg2Dur)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(reboundPwr / 8),
+      static_cast<uint16_t>(seg3Dur)
+    };
+  }
+  else if (totalReboundDur > 0)
+  {
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(reboundPwr),
+      static_cast<uint16_t>(totalReboundDur)
+    };
+  }
 
   return strike;
 }
 
+// Schedule a note to sound at a specific absolute time. Works backward
+// from the desired note time by the calibrated lag to determine when
+// the motor must be energized, then queues the shaped profile.
 void scheduleNote(size_t malletIndex, unsigned long targetNoteMillis, uint8_t velocity)
 {
   ScheduledStrike strike = buildStrikeForVelocity(malletIndex, velocity);
@@ -1273,6 +1448,7 @@ void handleSerialCommands()
         setMicModeFromCommand,
         runFftTestForMallet,
         setMalletMidiFromCommand,
+        printLoopStats,
       };
       SerialCommands::dispatch(command, handlers, kMalletCount, Serial);
       return;
@@ -1450,6 +1626,7 @@ void setup()
 
 void loop()
 {
+  trackLoopTiming();
   serviceFftAnalysis();
   updateMallets();
   handleSerialCommands();

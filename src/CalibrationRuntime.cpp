@@ -79,7 +79,7 @@ void setCalibrationInProgress(bool active)
 void configureProbeStrike(Mallet &mallet, int strikePower)
 {
   mallet.strikePower = constrain(strikePower, 250, 1023);
-  mallet.strikeDuration = 420;
+  mallet.strikeDuration = 300;
   mallet.coastPower = 0;
   mallet.coastDuration = 1;
   mallet.reboundPower = 0;
@@ -510,9 +510,9 @@ bool waitForMalletIdle(Mallet &mallet, unsigned long timeoutMs)
 
 void applyMalletTimingFromLag(Mallet &mallet, unsigned long lagMs)
 {
-  const unsigned long strikeDuration = constrain(static_cast<unsigned long>(lagMs * 1.5f), 100UL, 1600UL);
+  const unsigned long strikeDuration = constrain(static_cast<unsigned long>(lagMs * 1.3f), 100UL, 1600UL);
   const unsigned long coastDuration = constrain(static_cast<unsigned long>(lagMs * 0.10f), 0UL, 300UL);
-  const unsigned long reboundDuration = constrain(static_cast<unsigned long>(lagMs * 1.4f), 120UL, 2000UL);
+  const unsigned long reboundDuration = constrain(static_cast<unsigned long>(lagMs * 1.0f), 120UL, 2000UL);
 
   mallet.strikePower = 1023;
   mallet.strikeDuration = static_cast<int>(strikeDuration);

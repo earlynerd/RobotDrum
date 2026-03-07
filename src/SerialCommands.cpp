@@ -147,6 +147,13 @@ void dispatch(const String &input, const Handlers &handlers, size_t malletCount,
       handlers.setMalletMidiFromCommand(cmd);
     }
   }
+  else if (cmd == "loopstats")
+  {
+    if (handlers.printLoopStats != nullptr)
+    {
+      handlers.printLoopStats();
+    }
+  }
 }
 
 } // namespace SerialCommands

@@ -25,7 +25,6 @@ This is a PlatformIO project targeting ESP32 (PICO32 board, Arduino framework).
 - **`src/AudioDiagnostics.cpp/h`** — Serial diagnostic commands for real-time audio metrics.
 - **`src/SerialCommands.cpp/h`** — Command dispatcher (function pointer table mapping keywords to handlers).
 - **`lib/FFT/`** — Header-only FFT library (4096-point with Hann window).
-- **`lib/Goertzel/`** — Goertzel algorithm for targeted frequency detection.
 
 ### Audio pipeline
 
@@ -41,6 +40,16 @@ Shared state uses `volatile` variables; FreeRTOS task notifications synchronize 
 ### Hardware configuration
 
 10 mallets on pins `{15, 4, 12, 32, 27, 26, 25, 2, 13, 33}` mapped to MIDI notes `{52, 55, 57, 60, 62, 64, 65, 67, 69, 72}`. I2S mic on BCK=5, WS=9, DATA=10.
+
+### Mallet mechanical design
+
+Each mallet is a brushed DC motor driving a striker arm through a ~70-80° arc from near-vertical rest position down to the drum surface. A 3D-printed clockspring provides the restoring force back to rest (slight preload at rest). Soft bumpstops (removable padding) limit overtravel on the return.
+
+**Drive circuit:** Single N-channel MOSFET (low-side), single-quadrant — can only source current through the motor (torque toward drum, against spring) or coast (motor floats). No H-bridge, no active reverse torque, no regenerative braking.
+
+**Dynamics:** The system is a torsional spring-mass oscillator. The motor drives the mallet toward the drum against the spring; the spring returns it. Without rebound catch, the mallet slams the bumpstop and oscillates. The clockspring is firm — return time is approximately equal to strike time, giving an estimated natural period of T ≈ 2 × hardLagMs.
+
+**Rebound control:** During the return swing (mallet moving away from drum under spring force), applying forward motor torque acts as a brake (opposing the direction of motion). The current approach applies a constant low PWM for a fixed duration. This is analogous to input shaping / vibration cancellation in motion control — the goal is to remove kinetic energy from the return swing so the mallet settles at rest without oscillation or bumpstop impact.
 
 ### Serial commands (at runtime)
 

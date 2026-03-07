@@ -21,6 +21,7 @@ struct Handlers
   void (*setMicModeFromCommand)(const String &cmd);
   void (*runFftTestForMallet)(int index);
   void (*setMalletMidiFromCommand)(const String &cmd);
+  void (*printLoopStats)();
 };
 
 void dispatch(const String &input, const Handlers &handlers, size_t malletCount, Stream &out);
