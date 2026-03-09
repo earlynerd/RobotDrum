@@ -5,6 +5,7 @@
 #include "driver/i2s.h"
 #include "I2SMEMSSampler.h"
 #include "AudioDiagnostics.h"
+#include "BleCommands.h"
 #include "Calibration.h"
 #include "CalibrationRuntime.h"
 #include "SerialCommands.h"
@@ -166,6 +167,18 @@ uint32_t gLoopMaxUs = 0;
 uint64_t gLoopSumUs = 0;
 uint32_t gLoopHistBuckets[6] = {};  // <50, 50-100, 100-500, 500-1000, 1000-5000, >5000 us
 
+// Volume balance: per-mallet ceiling on the velocity curve so loud mallets
+// don't overpower quiet ones. Computed from calibrated impact data.
+// gVolumeMaxShaped[i] = 1.0 means no attenuation; < 1.0 compresses the
+// upper velocity range so the mallet's loudest hit matches the quietest
+// mallet's loudest hit.
+float gVolumeMaxShaped[kMalletCount];
+bool gVolumeBalanceEnabled = false;
+
+// Redirectable output stream for serial commands. Defaults to hardware
+// Serial but is swapped to a BLE stream when commands arrive over BLE.
+Stream *gCommandOut = nullptr;
+
 i2s_config_t gI2sConfig = {
     .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = kSampleRateHz,
@@ -235,35 +248,36 @@ void trackLoopTiming()
 
 void printLoopStats()
 {
+  Stream &out = *gCommandOut;
   if (gLoopCount == 0)
   {
-    Serial.println("loopstats: no data yet");
+    out.println("loopstats: no data yet");
     return;
   }
 
   const uint32_t avgUs = static_cast<uint32_t>(gLoopSumUs / gLoopCount);
-  Serial.print("loopstats: n=");
-  Serial.print(gLoopCount);
-  Serial.print(" min=");
-  Serial.print(gLoopMinUs);
-  Serial.print("us avg=");
-  Serial.print(avgUs);
-  Serial.print("us max=");
-  Serial.print(gLoopMaxUs);
-  Serial.println("us");
+  out.print("loopstats: n=");
+  out.print(gLoopCount);
+  out.print(" min=");
+  out.print(gLoopMinUs);
+  out.print("us avg=");
+  out.print(avgUs);
+  out.print("us max=");
+  out.print(gLoopMaxUs);
+  out.println("us");
 
-  Serial.print("  <50us=");
-  Serial.print(gLoopHistBuckets[0]);
-  Serial.print(" 50-100us=");
-  Serial.print(gLoopHistBuckets[1]);
-  Serial.print(" 100-500us=");
-  Serial.print(gLoopHistBuckets[2]);
-  Serial.print(" 0.5-1ms=");
-  Serial.print(gLoopHistBuckets[3]);
-  Serial.print(" 1-5ms=");
-  Serial.print(gLoopHistBuckets[4]);
-  Serial.print(" >5ms=");
-  Serial.println(gLoopHistBuckets[5]);
+  out.print("  <50us=");
+  out.print(gLoopHistBuckets[0]);
+  out.print(" 50-100us=");
+  out.print(gLoopHistBuckets[1]);
+  out.print(" 100-500us=");
+  out.print(gLoopHistBuckets[2]);
+  out.print(" 0.5-1ms=");
+  out.print(gLoopHistBuckets[3]);
+  out.print(" 1-5ms=");
+  out.print(gLoopHistBuckets[4]);
+  out.print(" >5ms=");
+  out.println(gLoopHistBuckets[5]);
 
   // Reset
   gLoopCount = 0;
@@ -287,6 +301,95 @@ void prepareMalletsForCalibration()
   {
     mallets[i].abortAndClearQueue();
   }
+}
+
+// Compute per-mallet volume balance from calibrated impact data.
+// Finds the quietest valid mallet at hard velocity and scales every other
+// mallet's velocity curve so its loudest hit doesn't exceed that level.
+//
+// Uses a linear model: impact(shaped) ≈ softImpact + (hardImpact - softImpact) * shaped
+// Then maxShaped = (targetImpact - softImpact) / (hardImpact - softImpact).
+void computeVolumeBalance()
+{
+  // Initialize all to 1.0 (no attenuation).
+  for (size_t i = 0; i < kMalletCount; ++i)
+  {
+    gVolumeMaxShaped[i] = 1.0f;
+  }
+
+  // Find the minimum hardImpact across all valid mallets.
+  uint32_t minHardImpact = UINT32_MAX;
+  int validCount = 0;
+  for (size_t i = 0; i < kMalletCount; ++i)
+  {
+    const Mallet::CalibrationModel model = mallets[i].getCalibration();
+    if (model.valid && model.hardImpact > 0)
+    {
+      if (model.hardImpact < minHardImpact)
+      {
+        minHardImpact = model.hardImpact;
+      }
+      validCount++;
+    }
+  }
+
+  if (validCount < 2 || minHardImpact == UINT32_MAX)
+  {
+    return;
+  }
+
+  const float target = static_cast<float>(minHardImpact);
+
+  for (size_t i = 0; i < kMalletCount; ++i)
+  {
+    const Mallet::CalibrationModel model = mallets[i].getCalibration();
+    if (!model.valid || model.hardImpact == 0)
+    {
+      continue;
+    }
+
+    const float softF = static_cast<float>(model.softImpact);
+    const float hardF = static_cast<float>(model.hardImpact);
+    const float range = hardF - softF;
+
+    if (range <= 0.0f || hardF <= target)
+    {
+      // This mallet is already at or below the target.
+      gVolumeMaxShaped[i] = 1.0f;
+      continue;
+    }
+
+    float maxShaped = (target - softF) / range;
+    // Floor at 0.15 so the mallet can still produce some sound even if
+    // it's dramatically louder than the quietest.
+    gVolumeMaxShaped[i] = clamp01(fmaxf(maxShaped, 0.15f));
+  }
+}
+
+void printVolumeBalance()
+{
+  Stream &out = *gCommandOut;
+  out.print("Volume balance: ");
+  out.println(gVolumeBalanceEnabled ? "ON" : "OFF");
+  for (size_t i = 0; i < kMalletCount; ++i)
+  {
+    const Mallet::CalibrationModel model = mallets[i].getCalibration();
+    out.print("  #");
+    out.print(i);
+    out.print(" pitch=");
+    out.print(mallets[i].getMidiPitch());
+    out.print(" hardImpact=");
+    out.print(model.hardImpact);
+    out.print(" maxVel=");
+    out.print(static_cast<int>(lroundf(gVolumeMaxShaped[i] * 100.0f)));
+    out.println("%");
+  }
+}
+
+void toggleVolumeBalance()
+{
+  gVolumeBalanceEnabled = !gVolumeBalanceEnabled;
+  printVolumeBalance();
 }
 
 void serviceDelay(unsigned long delayMs)
@@ -1192,16 +1295,37 @@ ScheduledStrike buildStrikeForVelocity(size_t malletIndex, uint8_t velocity)
   // Map MIDI velocity (1-127) to a 0-1 range with a slight power curve
   // so the lower velocities have finer dynamic control.
   const float velocityNorm = clamp01((static_cast<float>(velocity) - 1.0f) / 126.0f);
-  const float shaped = powf(velocityNorm, 1.25f);
+  float shaped = powf(velocityNorm, 1.25f);
+
+  // Volume balance: cap the shaped parameter so loud mallets don't exceed
+  // the quietest mallet's maximum volume.
+  if (gVolumeBalanceEnabled && gVolumeMaxShaped[malletIndex] < 1.0f)
+  {
+    shaped *= gVolumeMaxShaped[malletIndex];
+  }
 
   // Interpolate between the soft and hard calibration endpoints.
   const float lagF = lerp(static_cast<float>(model.softLagMs), static_cast<float>(model.hardLagMs), shaped);
   const float powerF = lerp(static_cast<float>(model.softPower), static_cast<float>(model.hardPower), shaped);
 
   const int strikePwr = constrain(static_cast<int>(lroundf(powerF)), 250, 1023);
-  const int totalStrikeDur = constrain(static_cast<int>(lroundf((lagF * 1.50f) + ((1.0f - shaped) * 120.0f))), 60, 600);
-  const int coastDur = constrain(static_cast<int>(lroundf(lagF * 0.10f)), 0, 300);
-  const int reboundPwr = constrain(static_cast<int>(lroundf(70.0f + (90.0f * shaped))), 40, 160);
+  // Use tuned strike duration if available from rebound calibration.
+  // The tuned value is for hard velocity; soft strikes get extra duration
+  // since they're slower and need more time to reach the drum.
+  const float strikeMul = (model.strikePct > 0)
+    ? (static_cast<float>(model.strikePct) / 100.0f)
+    : 1.50f;
+  const int totalStrikeDur = constrain(static_cast<int>(lroundf((lagF * strikeMul) + ((1.0f - shaped) * 120.0f))), 60, 600);
+
+  // No coast phase — elastic bounce means mallet is already rebounding.
+  const int coastDur = 0;
+
+  // Use tuned rebound power if available. The tuned value is for hard velocity;
+  // scale down for softer hits (40% at vel=0, 100% at vel=127).
+  const int reboundPwr = (model.reboundPeakPwr > 0)
+    ? constrain(static_cast<int>(lroundf(static_cast<float>(model.reboundPeakPwr) * (0.4f + 0.6f * shaped))), 20, 800)
+    : constrain(static_cast<int>(lroundf(70.0f + (90.0f * shaped))), 40, 160);
+
   const int totalReboundDur = constrain(static_cast<int>(lroundf((lagF * 1.40f) + ((1.0f - shaped) * 90.0f))), 30, 300);
 
   ScheduledStrike strike = {};
@@ -1292,7 +1416,9 @@ void scheduleNote(size_t malletIndex, unsigned long targetNoteMillis, uint8_t ve
 
 bool saveCalibrationToEeprom()
 {
-  return Calibration::saveToEeprom(mallets, kMalletCount, Serial);
+  const bool ok = Calibration::saveToEeprom(mallets, kMalletCount, Serial);
+  computeVolumeBalance();
+  return ok;
 }
 
 bool loadCalibrationFromEeprom()
@@ -1310,6 +1436,7 @@ bool loadCalibrationFromEeprom()
     mallets[i].setDelay(defaultLag);
     applyMalletTimingFromLag(mallets[i], defaultLag);
   }
+  computeVolumeBalance();
   return true;
 }
 
@@ -1341,6 +1468,16 @@ void runFullCalibration()
 void runFullCalibrationForMallet(size_t index)
 {
   CalibrationRuntime::runFullCalibrationForMallet(index);
+}
+
+void runReboundCalibration()
+{
+  CalibrationRuntime::runReboundCalibration();
+}
+
+void runReboundCalibrationForMallet(size_t index)
+{
+  CalibrationRuntime::runReboundCalibrationForMallet(index);
 }
 
 void printAudioStatus()
@@ -1375,17 +1512,18 @@ void setMicModeFromCommand(const String &cmd)
 
 void setMalletMidiFromCommand(const String &cmd)
 {
+  Stream &out = *gCommandOut;
   const int firstSpace = cmd.indexOf(' ');
   if (firstSpace < 0)
   {
-    Serial.println("setnote usage: setnote <malletIndex 0..9> <midi 0..127>");
+    out.println("setnote usage: setnote <malletIndex 0..9> <midi 0..127>");
     return;
   }
 
   const int secondSpace = cmd.indexOf(' ', firstSpace + 1);
   if (secondSpace < 0)
   {
-    Serial.println("setnote usage: setnote <malletIndex 0..9> <midi 0..127>");
+    out.println("setnote usage: setnote <malletIndex 0..9> <midi 0..127>");
     return;
   }
 
@@ -1394,28 +1532,30 @@ void setMalletMidiFromCommand(const String &cmd)
 
   if (malletIndex < 0 || malletIndex >= static_cast<int>(kMalletCount))
   {
-    Serial.print("setnote mallet index out of range 0..");
-    Serial.println(static_cast<int>(kMalletCount) - 1);
+    out.print("setnote mallet index out of range 0..");
+    out.println(static_cast<int>(kMalletCount) - 1);
     return;
   }
 
   if (midiNote < 0 || midiNote > 127)
   {
-    Serial.println("setnote midi out of range 0..127");
+    out.println("setnote midi out of range 0..127");
     return;
   }
 
   mallets[static_cast<size_t>(malletIndex)].setMidiPitch(midiNote);
   const bool saved = saveCalibrationToEeprom();
 
-  Serial.print("setnote #");
-  Serial.print(malletIndex);
-  Serial.print(" -> ");
-  Serial.print(midiNote);
-  Serial.print(" (saved=");
-  Serial.print(saved ? "yes" : "no");
-  Serial.println(")");
+  out.print("setnote #");
+  out.print(malletIndex);
+  out.print(" -> ");
+  out.print(midiNote);
+  out.print(" (saved=");
+  out.print(saved ? "yes" : "no");
+  out.println(")");
 }
+
+SerialCommands::Handlers gHandlers = {};
 
 constexpr size_t kSerialBufferMax = 64;
 char gSerialBuffer[kSerialBufferMax];
@@ -1434,23 +1574,8 @@ void handleSerialCommands()
       }
       const String command(gSerialBuffer, gSerialBufferPos);
       gSerialBufferPos = 0;
-      const SerialCommands::Handlers handlers = {
-        playCalibrationArpeggio,
-        runFullCalibration,
-        runFullCalibrationForMallet,
-        runVelocityCalibrationOnly,
-        printMalletStatus,
-        printAudioStatus,
-        printMicDiagnostics,
-        runMicProbe,
-        setMicChannelFromCommand,
-        setMicShiftFromCommand,
-        setMicModeFromCommand,
-        runFftTestForMallet,
-        setMalletMidiFromCommand,
-        printLoopStats,
-      };
-      SerialCommands::dispatch(command, handlers, kMalletCount, Serial);
+      gCommandOut = &Serial;
+      SerialCommands::dispatch(command, gHandlers, kMalletCount, Serial);
       return;
     }
 
@@ -1470,7 +1595,17 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint16_t time
     return;
   }
 
-  const unsigned long noteMillis = estimateNoteEventMillis(timestamp) + kMidiLeadTimeMs;
+  const unsigned long now = millis();
+  unsigned long noteMillis = estimateNoteEventMillis(timestamp) + kMidiLeadTimeMs;
+
+  // If the estimated event time is already in the past even after adding
+  // lead time, the BLE timestamp was stale or unreliable (common after
+  // fresh reconnections). Fall back to scheduling from now so lag
+  // compensation still works correctly.
+  if (static_cast<long>(noteMillis - now) < 0)
+  {
+    noteMillis = now + kMidiLeadTimeMs;
+  }
 
   for (size_t i = 0; i < kMalletCount; ++i)
   {
@@ -1608,18 +1743,52 @@ void setup()
     mallets[i].setRetriggerGap(kMalletRetriggerGapMs);
   }
 
+  gCommandOut = &Serial;
+
+  gHandlers.playCalibrationArpeggio = playCalibrationArpeggio;
+  gHandlers.runFullCalibration = runFullCalibration;
+  gHandlers.runFullCalibrationForMallet = runFullCalibrationForMallet;
+  gHandlers.runVelocityCalibrationOnly = runVelocityCalibrationOnly;
+  gHandlers.printMalletStatus = printMalletStatus;
+  gHandlers.printAudioStatus = printAudioStatus;
+  gHandlers.printMicDiagnostics = printMicDiagnostics;
+  gHandlers.runMicProbe = runMicProbe;
+  gHandlers.setMicChannelFromCommand = setMicChannelFromCommand;
+  gHandlers.setMicShiftFromCommand = setMicShiftFromCommand;
+  gHandlers.setMicModeFromCommand = setMicModeFromCommand;
+  gHandlers.runFftTestForMallet = runFftTestForMallet;
+  gHandlers.setMalletMidiFromCommand = setMalletMidiFromCommand;
+  gHandlers.printLoopStats = printLoopStats;
+  gHandlers.runReboundCalibration = runReboundCalibration;
+  gHandlers.runReboundCalibrationForMallet = runReboundCalibrationForMallet;
+  gHandlers.toggleVolumeBalance = toggleVolumeBalance;
+
   BLEMidiServer.begin(kBleDeviceName);
   BLEMidiServer.setOnConnectCallback([]() {
     Serial.println("BLE MIDI connected");
+    BleCommands::setConnected(true);
   });
   BLEMidiServer.setOnDisconnectCallback([]() {
     Serial.println("BLE MIDI disconnected");
+    BleCommands::setConnected(false);
   });
   BLEMidiServer.setNoteOnCallback(handleNoteOn);
   BLEMidiServer.setNoteOffCallback(handleNoteOff);
 
+  BleCommands::Config bleCmd = {};
+  bleCmd.pServer = BLEMidiServer.getServer();
+  bleCmd.handlers = gHandlers;
+  bleCmd.malletCount = kMalletCount;
+  bleCmd.commandOut = &gCommandOut;
+  BleCommands::initialize(bleCmd);
+
+  // Start BLE advertising after all services are registered.
+  // Must happen after both MIDI and command services are created,
+  // since ESP32 Bluedroid commits the GATT table on first advertise.
+  BLEMidiServer.getServer()->getAdvertising()->start();
+
   Serial.println("RobotDrum ready");
-  Serial.print("Serial commands: status, cal [idx], calvel, arp, setnote <idx> <midi>, audiostatus, micdiag, micprobe [ms], micch left|right, micshift <0..");
+  Serial.print("Serial commands: status, cal [idx], calvel, calrebound [idx], balance, arp, setnote <idx> <midi>, loopstats, audiostatus, micdiag, micprobe [ms], micch left|right, micshift <0..");
   Serial.print(kMicGainShiftMaxBits);
   Serial.println(">, micmode auto|stereo|mono, ffttest [index]");
 }
@@ -1630,4 +1799,5 @@ void loop()
   serviceFftAnalysis();
   updateMallets();
   handleSerialCommands();
+  BleCommands::poll();
 }

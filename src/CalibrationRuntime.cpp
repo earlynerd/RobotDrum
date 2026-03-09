@@ -410,7 +410,12 @@ bool calibrateVelocityForMallet(size_t index)
     waitForRingdown(gDeps.config.ringdownTimeoutMs);
   }
 
+  // Preserve existing rebound tuning so cal doesn't erase calrebound results.
+  const Mallet::CalibrationModel prev = mallet.getCalibration();
+
   Mallet::CalibrationModel model = {};
+  model.strikePct = prev.strikePct;
+  model.reboundPeakPwr = prev.reboundPeakPwr;
   model.softPower = (softHits > 0) ? static_cast<uint16_t>(softPowerSum / softHits) : static_cast<uint16_t>(constrain(static_cast<int>(gDeps.config.softPowerInitial + (2 * gDeps.config.softPowerStep)), 250, static_cast<int>(hardPower)));
   model.hardPower = hardPower;
   model.hardLagMs = (hardLagCount > 0) ? medianLagMs(hardLagSamples, hardLagCount) : 320;
@@ -485,6 +490,311 @@ void runFullCalibrationStepForMallet(size_t index)
 
   waitForRingdown(gDeps.config.ringdownTimeoutMs);
   serviceDelayMs(gDeps.config.calibrationInterMalletDelayMs);
+}
+
+// --- Rebound auto-tuning ---
+//
+// Sweeps coast timing and rebound brake power to find the profile that
+// produces the quietest settle after a strike. Intended for use with a
+// non-resonant dummy drum so the mic hears only mechanical noise.
+//
+// Strategy: two sequential 1D sweeps (coast then power) rather than a
+// full 2D grid, keeping the trial count manageable (~14 per mallet).
+
+constexpr int kReboundSettleWindowMs = 600;
+constexpr int kReboundInterTrialDelayMs = 150;
+constexpr int kReboundStrikeSteps = 7;
+constexpr int kReboundPowerSteps = 8;
+// Strike duration as % of lag. The rubber ball bounce means the mallet
+// leaves the drum almost immediately, so shorter values release sooner
+// and let braking start earlier.
+constexpr uint8_t kReboundStrikeValues[kReboundStrikeSteps] = {100, 110, 120, 130, 140, 150, 170};
+// Peak rebound brake PWM — wider range since elastic bounce preserves
+// much of the strike energy. Heavier mallets may need 600+ to brake.
+constexpr uint16_t kReboundPowerValues[kReboundPowerSteps] = {50, 100, 170, 250, 350, 500, 650, 800};
+constexpr uint8_t kReboundDefaultStrikePct = 150;
+constexpr uint16_t kReboundDefaultPower = 250;
+
+unsigned long totalProfileDuration(const Mallet::StrikeProfile &profile)
+{
+  unsigned long total = 0;
+  for (uint8_t i = 0; i < profile.count; ++i)
+  {
+    total += profile.segments[i].durationMs;
+  }
+  return total;
+}
+
+// Build a shaped test profile with specific strike duration and rebound power.
+// strikePct = strike duration as % of lag (100 = cut power right at contact).
+// No coast phase — the elastic bounce means the mallet is already moving
+// away from the drum by the time the motor releases.
+Mallet::StrikeProfile buildReboundTestProfile(
+    const Mallet::CalibrationModel &model,
+    uint8_t strikePct,
+    uint16_t reboundPwr)
+{
+  const int strikePwr = constrain(static_cast<int>(model.hardPower), 250, 1023);
+  const float lagF = static_cast<float>(model.hardLagMs);
+
+  const int totalStrikeDur = constrain(static_cast<int>(lagF * static_cast<float>(strikePct) / 100.0f), 30, 600);
+  const int totalReboundDur = constrain(static_cast<int>(lagF * 1.4f), 30, 400);
+  const int clampedRebPwr = constrain(static_cast<int>(reboundPwr), 0, 1023);
+
+  Mallet::StrikeProfile prof = {};
+  prof.count = 0;
+
+  // Strike ramp + hold
+  constexpr int kRampStepMs = 5;
+  if (totalStrikeDur > 20)
+  {
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(strikePwr / 3),
+      static_cast<uint16_t>(kRampStepMs)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>((strikePwr * 2) / 3),
+      static_cast<uint16_t>(kRampStepMs)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(strikePwr),
+      static_cast<uint16_t>(totalStrikeDur - (2 * kRampStepMs))
+    };
+  }
+  else
+  {
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(strikePwr),
+      static_cast<uint16_t>(totalStrikeDur)
+    };
+  }
+
+  // No coast — go straight to rebound brake.
+  // Tapered brake: 100% / 40% / 12.5% of peak power.
+  if (totalReboundDur > 6 && prof.count + 3 <= Mallet::kMaxStrikeSegments)
+  {
+    const int seg1 = (totalReboundDur * 2) / 5;
+    const int seg2 = (totalReboundDur * 3) / 10;
+    const int seg3 = totalReboundDur - seg1 - seg2;
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(clampedRebPwr),
+      static_cast<uint16_t>(seg1)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>((clampedRebPwr * 2) / 5),
+      static_cast<uint16_t>(seg2)
+    };
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(clampedRebPwr / 8),
+      static_cast<uint16_t>(seg3)
+    };
+  }
+  else if (totalReboundDur > 0)
+  {
+    prof.segments[prof.count++] = {
+      static_cast<uint16_t>(clampedRebPwr),
+      static_cast<uint16_t>(totalReboundDur)
+    };
+  }
+
+  return prof;
+}
+
+// Strike with a candidate profile, then measure the total acoustic energy
+// in a window after the profile completes. Lower energy = quieter settle.
+//
+// Streams timestamped mic samples to serial for offline analysis.
+// Output format (CSV):
+//   R,<strikePct>,<reboundPwr>,<phase>,<tMs>,<mic>,<baseline>
+//   phase: S=strike/rebound profile active, T=settle measurement window
+//
+// Downsample factor controls how often samples are emitted (every Nth ms)
+// to avoid flooding serial at 115200 baud.
+constexpr int kStreamDownsampleMs = 4;
+
+struct TrialResult
+{
+  uint32_t settleEnergy;  // total |mic - baseline| during settle window
+  int32_t peakImpact;     // peak mic reading during strike phase (above baseline)
+};
+
+TrialResult measureTrial(
+    Mallet &mallet,
+    const Mallet::StrikeProfile &profile,
+    uint8_t strikePct,
+    uint16_t reboundPwr)
+{
+  TrialResult result = {UINT32_MAX, 0};
+
+  if (!CalibrationRuntime::waitForMalletIdle(mallet, gDeps.config.calibrationMalletIdleTimeoutMs))
+  {
+    return result;
+  }
+  waitForRingdown(gDeps.config.ringdownTimeoutMs);
+
+  // Sample ambient baseline
+  const AmbientWindowStats ambient = sampleAmbientWindow(80);
+  const int32_t baseline = (ambient.minValue + ambient.maxValue) / 2;
+
+  // Fire the test profile
+  const unsigned long strikeStart = millis();
+  mallet.delayedTrigger(0, profile);
+
+  // Stream mic during strike+rebound phase, track peak impact
+  const unsigned long profileMs = totalProfileDuration(profile);
+  unsigned long lastStreamMs = 0;
+  int32_t peakMic = baseline;
+  while (millis() - strikeStart < profileMs + 10)
+  {
+    const int32_t mic = readFilteredMic();
+    if (mic > peakMic)
+    {
+      peakMic = mic;
+    }
+
+    const unsigned long elapsed = millis() - strikeStart;
+    if (elapsed - lastStreamMs >= static_cast<unsigned long>(kStreamDownsampleMs))
+    {
+      lastStreamMs = elapsed;
+      gDeps.log->print("R,");
+      gDeps.log->print(strikePct);
+      gDeps.log->print(",");
+      gDeps.log->print(reboundPwr);
+      gDeps.log->print(",S,");
+      gDeps.log->print(elapsed);
+      gDeps.log->print(",");
+      gDeps.log->print(mic);
+      gDeps.log->print(",");
+      gDeps.log->println(baseline);
+    }
+    updateMalletsTick();
+  }
+
+  result.peakImpact = (peakMic > baseline) ? (peakMic - baseline) : 0;
+
+  // Measure and stream the settle window
+  uint64_t energy = 0;
+  const unsigned long settleStart = millis();
+  lastStreamMs = 0;
+  while (millis() - settleStart < static_cast<unsigned long>(kReboundSettleWindowMs))
+  {
+    const int32_t mic = readFilteredMic();
+    const int32_t delta = mic - baseline;
+    energy += static_cast<uint64_t>(abs(delta));
+
+    const unsigned long elapsed = millis() - settleStart;
+    if (elapsed - lastStreamMs >= static_cast<unsigned long>(kStreamDownsampleMs))
+    {
+      lastStreamMs = elapsed;
+      gDeps.log->print("R,");
+      gDeps.log->print(strikePct);
+      gDeps.log->print(",");
+      gDeps.log->print(reboundPwr);
+      gDeps.log->print(",T,");
+      gDeps.log->print(elapsed);
+      gDeps.log->print(",");
+      gDeps.log->print(mic);
+      gDeps.log->print(",");
+      gDeps.log->println(baseline);
+    }
+    updateMalletsTick();
+  }
+
+  result.settleEnergy = (energy > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(energy);
+  return result;
+}
+
+// Run the two-pass sweep for one mallet. Returns true if tuning succeeded.
+//
+// Pass 1: Sweep strike duration — choose the duration that produces the
+//   LOUDEST hit (highest peak mic). Strike duration controls how long the
+//   motor drives before releasing. Too short = mallet hasn't reached full
+//   velocity at contact. Too long = motor fights the rebound unnecessarily.
+//
+// Pass 2: Sweep rebound brake power at the best strike duration — choose
+//   the power that produces the QUIETEST settle (lowest acoustic energy
+//   in the window after the profile completes).
+bool tuneReboundForMallet(size_t index)
+{
+  Mallet &mallet = gDeps.mallets[index];
+  Mallet::CalibrationModel model = mallet.getCalibration();
+  if (!model.valid)
+  {
+    gDeps.log->println("  skipping: no valid calibration");
+    return false;
+  }
+
+  gDeps.log->println("  pass 1: sweep strike duration (maximize impact)");
+
+  // Pass 1: sweep strike% with default rebound power, pick highest peak
+  uint8_t bestStrike = kReboundDefaultStrikePct;
+  int32_t bestStrikePeak = 0;
+
+  for (int i = 0; i < kReboundStrikeSteps; ++i)
+  {
+    const uint8_t strikePct = kReboundStrikeValues[i];
+    const Mallet::StrikeProfile prof = buildReboundTestProfile(model, strikePct, kReboundDefaultPower);
+    const TrialResult trial = measureTrial(mallet, prof, strikePct, kReboundDefaultPower);
+
+    gDeps.log->print("    strike=");
+    gDeps.log->print(strikePct);
+    gDeps.log->print("% peak=");
+    gDeps.log->print(trial.peakImpact);
+    gDeps.log->print(" energy=");
+    gDeps.log->println(trial.settleEnergy);
+
+    if (trial.peakImpact > bestStrikePeak)
+    {
+      bestStrikePeak = trial.peakImpact;
+      bestStrike = strikePct;
+    }
+
+    serviceDelayMs(kReboundInterTrialDelayMs);
+  }
+
+  gDeps.log->print("  best strike=");
+  gDeps.log->print(bestStrike);
+  gDeps.log->print("% peak=");
+  gDeps.log->println(bestStrikePeak);
+
+  gDeps.log->println("  pass 2: sweep rebound power (minimize settle)");
+
+  // Pass 2: sweep rebound power with the best strike duration, pick lowest energy
+  uint16_t bestPower = kReboundDefaultPower;
+  uint32_t bestPowerEnergy = UINT32_MAX;
+
+  for (int i = 0; i < kReboundPowerSteps; ++i)
+  {
+    const uint16_t rebPwr = kReboundPowerValues[i];
+    const Mallet::StrikeProfile prof = buildReboundTestProfile(model, bestStrike, rebPwr);
+    const TrialResult trial = measureTrial(mallet, prof, bestStrike, rebPwr);
+
+    gDeps.log->print("    pwr=");
+    gDeps.log->print(rebPwr);
+    gDeps.log->print(" peak=");
+    gDeps.log->print(trial.peakImpact);
+    gDeps.log->print(" energy=");
+    gDeps.log->println(trial.settleEnergy);
+
+    if (trial.settleEnergy < bestPowerEnergy)
+    {
+      bestPowerEnergy = trial.settleEnergy;
+      bestPower = rebPwr;
+    }
+
+    serviceDelayMs(kReboundInterTrialDelayMs);
+  }
+
+  gDeps.log->print("  best: strike=");
+  gDeps.log->print(bestStrike);
+  gDeps.log->print("% pwr=");
+  gDeps.log->println(bestPower);
+
+  model.strikePct = bestStrike;
+  model.reboundPeakPwr = bestPower;
+  mallet.setCalibration(model);
+
+  return true;
 }
 
 } // namespace
@@ -765,6 +1075,88 @@ void runFullCalibrationForMallet(size_t index)
     gDeps.callbacks.printMalletStatus();
   }
   gDeps.log->print("Full calibration complete for mallet #");
+  gDeps.log->println(index);
+  if (gDeps.callbacks.prepareMalletsForCalibration != nullptr)
+  {
+    gDeps.callbacks.prepareMalletsForCalibration();
+  }
+  setCalibrationInProgress(false);
+}
+
+void runReboundCalibration()
+{
+  if (!dependenciesReady())
+  {
+    return;
+  }
+
+  setCalibrationInProgress(true);
+  if (gDeps.callbacks.prepareMalletsForCalibration != nullptr)
+  {
+    gDeps.callbacks.prepareMalletsForCalibration();
+  }
+  gDeps.log->println("Starting rebound calibration");
+  gDeps.log->println("(use non-resonant dummy drum for best results)");
+
+  for (size_t i = 0; i < gDeps.malletCount; ++i)
+  {
+    gDeps.mallets[i].abortAndClearQueue();
+    gDeps.log->print("Tuning rebound for mallet #");
+    gDeps.log->println(i);
+    tuneReboundForMallet(i);
+    waitForRingdown(gDeps.config.ringdownTimeoutMs);
+    serviceDelayMs(gDeps.config.calibrationInterMalletDelayMs);
+  }
+
+  if (gDeps.callbacks.saveCalibrationToEeprom != nullptr)
+  {
+    gDeps.callbacks.saveCalibrationToEeprom();
+  }
+  if (gDeps.callbacks.printMalletStatus != nullptr)
+  {
+    gDeps.callbacks.printMalletStatus();
+  }
+  gDeps.log->println("Rebound calibration complete");
+  if (gDeps.callbacks.prepareMalletsForCalibration != nullptr)
+  {
+    gDeps.callbacks.prepareMalletsForCalibration();
+  }
+  setCalibrationInProgress(false);
+}
+
+void runReboundCalibrationForMallet(size_t index)
+{
+  if (!dependenciesReady())
+  {
+    return;
+  }
+  if (index >= gDeps.malletCount)
+  {
+    gDeps.log->print("calrebound mallet index out of range 0..");
+    gDeps.log->println(static_cast<int>(gDeps.malletCount) - 1);
+    return;
+  }
+
+  setCalibrationInProgress(true);
+  if (gDeps.callbacks.prepareMalletsForCalibration != nullptr)
+  {
+    gDeps.callbacks.prepareMalletsForCalibration();
+  }
+  gDeps.mallets[index].abortAndClearQueue();
+  gDeps.log->print("Tuning rebound for mallet #");
+  gDeps.log->println(index);
+
+  tuneReboundForMallet(index);
+
+  if (gDeps.callbacks.saveCalibrationToEeprom != nullptr)
+  {
+    gDeps.callbacks.saveCalibrationToEeprom();
+  }
+  if (gDeps.callbacks.printMalletStatus != nullptr)
+  {
+    gDeps.callbacks.printMalletStatus();
+  }
+  gDeps.log->print("Rebound calibration complete for mallet #");
   gDeps.log->println(index);
   if (gDeps.callbacks.prepareMalletsForCalibration != nullptr)
   {

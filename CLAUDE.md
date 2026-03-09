@@ -53,7 +53,7 @@ Each mallet is a brushed DC motor driving a striker arm through a ~70-80° arc f
 
 ### Serial commands (at runtime)
 
-`status`, `cal [idx]`, `calvel`, `arp`, `audiostatus`, `micdiag`, `micprobe [ms]`, `micch`, `micshift <0-8>`, `micmode`, `ffttest [idx]`, `setnote <idx> <midi>`
+`status`, `cal [idx]`, `calvel`, `calrebound [idx]`, `arp`, `loopstats`, `audiostatus`, `micdiag`, `micprobe [ms]`, `micch`, `micshift <0-8>`, `micmode`, `ffttest [idx]`, `setnote <idx> <midi>`
 
 ## Code Style
 

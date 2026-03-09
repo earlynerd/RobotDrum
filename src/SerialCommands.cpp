@@ -154,6 +154,35 @@ void dispatch(const String &input, const Handlers &handlers, size_t malletCount,
       handlers.printLoopStats();
     }
   }
+  else if (cmd == "calrebound")
+  {
+    if (handlers.runReboundCalibration != nullptr)
+    {
+      handlers.runReboundCalibration();
+    }
+  }
+  else if (cmd.startsWith("calrebound "))
+  {
+    String malletToken = cmd.substring(11);
+    malletToken.trim();
+    const int malletIndex = malletToken.toInt();
+    if (malletIndex < 0 || malletIndex >= static_cast<int>(malletCount))
+    {
+      out.print("calrebound mallet index out of range 0..");
+      out.println(static_cast<int>(malletCount) - 1);
+    }
+    else if (handlers.runReboundCalibrationForMallet != nullptr)
+    {
+      handlers.runReboundCalibrationForMallet(static_cast<size_t>(malletIndex));
+    }
+  }
+  else if (cmd == "balance")
+  {
+    if (handlers.toggleVolumeBalance != nullptr)
+    {
+      handlers.toggleVolumeBalance();
+    }
+  }
 }
 
 } // namespace SerialCommands

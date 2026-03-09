@@ -44,6 +44,7 @@ class Mallet{
   // "soft" and "hard" represent the endpoints of the velocity range.
   // lagMs = time from energize to drum contact at that power level.
   // impact = peak mic amplitude from the strike (proxy for loudness).
+  // strikePct and reboundPeakPwr are set by rebound auto-tuning (calrebound).
   struct CalibrationModel
   {
     uint16_t softPower;
@@ -53,6 +54,8 @@ class Mallet{
     uint32_t softImpact;
     uint32_t hardImpact;
     bool valid;
+    uint8_t strikePct;       // strike duration as % of lag (0 = default 150%)
+    uint16_t reboundPeakPwr; // peak rebound PWM at hard velocity (0 = use default)
   };
 
   struct StrikeSegment
@@ -124,7 +127,7 @@ class Mallet{
   void handleQueuedStrikes();
   unsigned long minRetriggerGapMs = 0;
   unsigned long lastCycleEndMillis = 0;
-  CalibrationModel calibration = {460, 1023, 420, 300, 1, 2, false};
+  CalibrationModel calibration = {460, 1023, 420, 300, 1, 2, false, 0, 0};
 
   State malletState = IDLESTATE;
   StrikeProfile activeProfile = {};   // profile currently being executed

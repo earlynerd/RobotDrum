@@ -5,7 +5,7 @@
 namespace
 {
 constexpr uint32_t kCalibrationMagic = 0x52444232; // "RDB2"
-constexpr uint16_t kCalibrationVersion = 2;
+constexpr uint16_t kCalibrationVersion = 3;
 
 struct CalibrationHeader
 {
@@ -25,7 +25,8 @@ struct CalibrationEntry
   uint32_t softImpact;
   uint32_t hardImpact;
   uint8_t valid;
-  uint8_t reserved[3];
+  uint8_t strikePct;       // rebound tuning: strike duration as % of lag (0 = default)
+  uint16_t reboundPeakPwr; // rebound tuning: peak brake PWM (0 = default)
 };
 
 constexpr size_t kCalibrationHeaderAddress = 0;
@@ -42,6 +43,8 @@ Mallet::CalibrationModel buildDefaultModel()
     1,
     2,
     false,
+    0,
+    0,
   };
 }
 
@@ -58,6 +61,8 @@ CalibrationEntry buildCalibrationEntry(const Mallet &mallet)
   entry.softImpact = model.softImpact;
   entry.hardImpact = model.hardImpact;
   entry.valid = model.valid ? 1 : 0;
+  entry.strikePct = model.strikePct;
+  entry.reboundPeakPwr = model.reboundPeakPwr;
   return entry;
 }
 
@@ -73,6 +78,8 @@ void applyCalibrationEntry(Mallet &mallet, const CalibrationEntry &entry)
     model.softImpact = entry.softImpact;
     model.hardImpact = entry.hardImpact;
     model.valid = true;
+    model.strikePct = entry.strikePct;
+    model.reboundPeakPwr = entry.reboundPeakPwr;
     mallet.setCalibration(model);
   }
   else
@@ -195,8 +202,28 @@ void printStatus(const Mallet *mallets, size_t count, Stream &out)
     out.print(model.softImpact);
     out.print(" impactHard=");
     out.print(model.hardImpact);
+    out.print(" strike=");
+    out.print(model.strikePct);
+    out.print("% rebPwr=");
+    out.print(model.reboundPeakPwr);
     out.print(" valid=");
-    out.println(model.valid ? "yes" : "no");
+    out.print(model.valid ? "yes" : "no");
+
+    // Print minimum cycle time for composition reference.
+    // Computed for hard velocity (shortest lag = tightest retrigger constraint).
+    if (model.valid)
+    {
+      const float lagF = static_cast<float>(model.hardLagMs);
+      const float strikeMul = (model.strikePct > 0)
+        ? (static_cast<float>(model.strikePct) / 100.0f) : 1.50f;
+      const int strikeDur = constrain(static_cast<int>(lagF * strikeMul), 60, 600);
+      const int reboundDur = constrain(static_cast<int>(lagF * 1.40f), 30, 300);
+      const unsigned long cycleMs = static_cast<unsigned long>(strikeDur + reboundDur)
+                                    + mallets[i].getRetriggerGap();
+      out.print(" cycleMs=");
+      out.print(cycleMs);
+    }
+    out.println();
   }
 }
 

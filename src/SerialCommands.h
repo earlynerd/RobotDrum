@@ -22,6 +22,9 @@ struct Handlers
   void (*runFftTestForMallet)(int index);
   void (*setMalletMidiFromCommand)(const String &cmd);
   void (*printLoopStats)();
+  void (*runReboundCalibration)();
+  void (*runReboundCalibrationForMallet)(size_t index);
+  void (*toggleVolumeBalance)();
 };
 
 void dispatch(const String &input, const Handlers &handlers, size_t malletCount, Stream &out);

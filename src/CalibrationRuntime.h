@@ -68,6 +68,8 @@ void playCalibrationArpeggio();
 void runVelocityCalibrationOnly();
 void runFullCalibration();
 void runFullCalibrationForMallet(size_t index);
+void runReboundCalibration();
+void runReboundCalibrationForMallet(size_t index);
 
 } // namespace CalibrationRuntime
 
