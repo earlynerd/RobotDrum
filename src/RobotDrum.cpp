@@ -21,8 +21,8 @@ constexpr unsigned long kImpactDetectGuardMs = 60;
 constexpr unsigned long kCalibrationHardMaxLagMs = 400;
 constexpr unsigned long kCalibrationSoftLagSlackMs = 180;
 constexpr unsigned long kCalibrationSoftMaxLagFloorMs = 300;
-constexpr unsigned long kRingdownTimeoutMs = 1800;
-constexpr unsigned long kRingdownStableMs = 80;
+constexpr unsigned long kRingdownTimeoutMs = 2500;
+constexpr unsigned long kRingdownStableMs = 150;
 constexpr unsigned long kFftTimeoutMs = 1200;
 constexpr unsigned long kMalletRetriggerGapMs = 60;
 constexpr unsigned long kPitchCaptureOffsetMs = 600;
@@ -51,7 +51,7 @@ constexpr int32_t kImpactNoiseMultiplier = 3;
 constexpr int32_t kHardMinRiseFloor = 12000;
 constexpr int32_t kSoftMinRiseFloor = 15000;
 constexpr int32_t kSoftMinRiseHardDivisor = 5;
-constexpr uint16_t kSoftPowerInitial = 640;
+constexpr uint16_t kSoftPowerInitial = 500;
 constexpr uint16_t kSoftPowerStep = 120;
 constexpr uint16_t kSoftPowerMax = 900;
 constexpr int kSoftPowerAttempts = 4;
@@ -1442,7 +1442,7 @@ bool loadCalibrationFromEeprom()
 
 void printMalletStatus()
 {
-  Calibration::printStatus(mallets, kMalletCount, Serial);
+  Calibration::printStatus(mallets, kMalletCount, *gCommandOut);
 }
 
 void runFftTestForMallet(int index)
@@ -1550,6 +1550,88 @@ void setMalletMidiFromCommand(const String &cmd)
   out.print(malletIndex);
   out.print(" -> ");
   out.print(midiNote);
+  out.print(" (saved=");
+  out.print(saved ? "yes" : "no");
+  out.println(")");
+}
+
+void setMalletStrikeFromCommand(const String &cmd)
+{
+  Stream &out = *gCommandOut;
+  const int firstSpace = cmd.indexOf(' ');
+  if (firstSpace < 0)
+  {
+    out.println("setstrike usage: setstrike <malletIndex 0..9> <percent 50..250>");
+    return;
+  }
+  const int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0)
+  {
+    out.println("setstrike usage: setstrike <malletIndex 0..9> <percent 50..250>");
+    return;
+  }
+  const int malletIndex = cmd.substring(firstSpace + 1, secondSpace).toInt();
+  const int pct = cmd.substring(secondSpace + 1).toInt();
+  if (malletIndex < 0 || malletIndex >= static_cast<int>(kMalletCount))
+  {
+    out.print("setstrike mallet index out of range 0..");
+    out.println(static_cast<int>(kMalletCount) - 1);
+    return;
+  }
+  if (pct < 50 || pct > 250)
+  {
+    out.println("setstrike percent out of range 50..250");
+    return;
+  }
+  Mallet::CalibrationModel model = mallets[static_cast<size_t>(malletIndex)].getCalibration();
+  model.strikePct = static_cast<uint8_t>(pct);
+  mallets[static_cast<size_t>(malletIndex)].setCalibration(model);
+  const bool saved = saveCalibrationToEeprom();
+  out.print("setstrike #");
+  out.print(malletIndex);
+  out.print(" -> ");
+  out.print(pct);
+  out.print("% (saved=");
+  out.print(saved ? "yes" : "no");
+  out.println(")");
+}
+
+void setMalletReboundFromCommand(const String &cmd)
+{
+  Stream &out = *gCommandOut;
+  const int firstSpace = cmd.indexOf(' ');
+  if (firstSpace < 0)
+  {
+    out.println("setrebound usage: setrebound <malletIndex 0..9> <power 0..800>");
+    return;
+  }
+  const int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0)
+  {
+    out.println("setrebound usage: setrebound <malletIndex 0..9> <power 0..800>");
+    return;
+  }
+  const int malletIndex = cmd.substring(firstSpace + 1, secondSpace).toInt();
+  const int pwr = cmd.substring(secondSpace + 1).toInt();
+  if (malletIndex < 0 || malletIndex >= static_cast<int>(kMalletCount))
+  {
+    out.print("setrebound mallet index out of range 0..");
+    out.println(static_cast<int>(kMalletCount) - 1);
+    return;
+  }
+  if (pwr < 0 || pwr > 800)
+  {
+    out.println("setrebound power out of range 0..800");
+    return;
+  }
+  Mallet::CalibrationModel model = mallets[static_cast<size_t>(malletIndex)].getCalibration();
+  model.reboundPeakPwr = static_cast<uint16_t>(pwr);
+  mallets[static_cast<size_t>(malletIndex)].setCalibration(model);
+  const bool saved = saveCalibrationToEeprom();
+  out.print("setrebound #");
+  out.print(malletIndex);
+  out.print(" -> ");
+  out.print(pwr);
   out.print(" (saved=");
   out.print(saved ? "yes" : "no");
   out.println(")");
@@ -1758,6 +1840,8 @@ void setup()
   gHandlers.setMicModeFromCommand = setMicModeFromCommand;
   gHandlers.runFftTestForMallet = runFftTestForMallet;
   gHandlers.setMalletMidiFromCommand = setMalletMidiFromCommand;
+  gHandlers.setMalletStrikeFromCommand = setMalletStrikeFromCommand;
+  gHandlers.setMalletReboundFromCommand = setMalletReboundFromCommand;
   gHandlers.printLoopStats = printLoopStats;
   gHandlers.runReboundCalibration = runReboundCalibration;
   gHandlers.runReboundCalibrationForMallet = runReboundCalibrationForMallet;

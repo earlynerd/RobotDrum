@@ -1,0 +1,105 @@
+﻿
+Starting full calibration for mallet #0
+Calibrating mallet #0
+    hard: ambient=1500 threshold=3207 rise=457724 minRise=12000 noise=529 lag=92 hit=yes
+    soft: pwr=640 ambient=1935 threshold=4323 rise=347724 minRise=91544 noise=756 lag=140 hit=yes
+    hard: ambient=1606 threshold=3820 rise=970197 minRise=12000 noise=698 lag=103 hit=yes
+    soft: pwr=640 ambient=1538 threshold=3170 rise=733545 minRise=194039 noise=504 lag=142 hit=yes
+    hard: ambient=1675 threshold=3298 rise=1201825 minRise=12000 noise=501 lag=60 hit=yes
+    soft: pwr=640 ambient=2170 threshold=5866 rise=737936 minRise=240365 noise=1192 lag=174 hit=yes
+  velocity: softLag=142 hardLag=92 softImpact=606401 hardImpact=876582 valid=yes
+  pitchHz=163.49 mag=636566.25 detected=52 midi=52
+Saved calibration, writeCount=126, status=ok
+Mallet status:
+  #0 pitch=52 lagSoft=142 lagHard=92 pwrSoft=640 pwrHard=1023 impactSoft=606401 impactHard=876582 strike=150% rebPwr=500 valid=yes cycleMs=326
+  #1 pitch=52 lagSoft=60 lagHard=60 pwrSoft=640 pwrHard=1023 impactSoft=497613 impactHard=950487 strike=170% rebPwr=100 valid=yes cycleMs=246
+  #2 pitch=62 lagSoft=182 lagHard=129 pwrSoft=640 pwrHard=1023 impactSoft=1574523 impactHard=2911788 strike=100% rebPwr=500 valid=yes cycleMs=369
+  #3 pitch=55 lagSoft=175 lagHard=125 pwrSoft=640 pwrHard=1023 impactSoft=1200242 impactHard=1953969 strike=130% rebPwr=500 valid=yes cycleMs=397
+  #4 pitch=60 lagSoft=172 lagHard=122 pwrSoft=640 pwrHard=1023 impactSoft=854549 impactHard=1945504 strike=100% rebPwr=50 valid=yes cycleMs=352
+  #5 pitch=67 lagSoft=131 lagHard=105 pwrSoft=760 pwrHard=1023 impactSoft=2063379 impactHard=3815477 strike=170% rebPwr=650 valid=yes cycleMs=385
+  #6 pitch=72 lagSoft=110 lagHard=63 pwrSoft=760 pwrHard=1023 impactSoft=1026679 impactHard=1550144 strike=170% rebPwr=170 valid=yes cycleMs=255
+  #7 pitch=69 lagSoft=60 lagHard=60 pwrSoft=880 pwrHard=1023 impactSoft=1055979 impactHard=1976445 strike=150% rebPwr=800 valid=yes cycleMs=234
+  #8 pitch=65 lagSoft=129 lagHard=112 pwrSoft=880 pwrHard=1023 impactSoft=1925370 impactHard=3280509 strike=110% rebPwr=800 valid=yes cycleMs=339
+  #9 pitch=64 lagSoft=140 lagHard=106 pwrSoft=760 pwrHard=1023 impactSoft=845016 impactHard=2060388 strike=150% rebPwr=800 valid=yes cycleMs=367
+Full calibration complete for mallet #0
+setnote 0 57
+Saved calibration, writeCount=127, status=ok
+setnote #0 -> 57 (saved=yes)
+calrebound 0
+Tuning rebound for mallet #0
+  pass 1: sweep strike duration (maximize impact)
+    strike=70% peak=11757 energy=1751504    strike=80% peak=194665 energy=2918201    strike=90% peak=227368 energy=2990366    strike=100% peak=517220 energy=1924166    strike=115% peak=366193 energy=1615523
+    strike=130% peak=735525 energy=2739642    strike=150% peak=554509 energy=2108818
+  best strike=130% peak=735525
+  pass 2: sweep rebound power (minimize settle)
+    pwr=50 peak=435906 energy=2374915
+    pwr=100 peak=447576 energy=2135671
+    pwr=170 peak=451132 energy=1706469
+    pwr=250 peak=472122 energy=2049084
+    pwr=350 peak=613277 energy=1470988
+    pwr=500 peak=809550 energy=1370304
+    pwr=650 peak=1093267 energy=1627984
+    pwr=800 peak=1196714 energy=3622733
+  best: strike=130% pwr=500
+Saved calibration, writeCount=128, status=ok
+Mallet status:
+  #0 pitch=57 lagSoft=142 lagHard=92 pwrSoft=640 pwrHard=1023 impactSoft=606401 impactHard=876582 strike=130% rebPwr=500 valid=yes cycleMs=307
+  #1 pitch=52 lagSoft=60 lagHard=60 pwrSoft=640 pwrHard=1023 impactSoft=497613 impactHard=950487 strike=170% rebPwr=100 valid=yes cycleMs=246
+  #2 pitch=62 lagSoft=182 lagHard=129 pwrSoft=640 pwrHard=1023 impactSoft=1574523 impactHard=2911788 strike=100% rebPwr=500 valid=yes cycleMs=369
+  #3 pitch=55 lagSoft=175 lagHard=125 pwrSoft=640 pwrHard=1023 impactSoft=1200242 impactHard=1953969 strike=130% rebPwr=500 valid=yes cycleMs=397
+  #4 pitch=60 lagSoft=172 lagHard=122 pwrSoft=640 pwrHard=1023 impactSoft=854549 impactHard=1945504 strike=100% rebPwr=50 valid=yes cycleMs=352
+  #5 pitch=67 lagSoft=131 lagHard=105 pwrSoft=760 pwrHard=1023 impactSoft=2063379 impactHard=3815477 strike=170% rebPwr=650 valid=yes cycleMs=385
+  #6 pitch=72 lagSoft=110 lagHard=63 pwrSoft=760 pwrHard=1023 impactSoft=1026679 impactHard=1550144 strike=170% rebPwr=170 valid=yes cycleMs=255
+  #7 pitch=69 lagSoft=60 lagHard=60 pwrSoft=880 pwrHard=1023 impactSoft=1055979 impactHard=1976445 strike=150% rebPwr=800 valid=yes cycleMs=234
+  #8 pitch=65 lagSoft=129 lagHard=112 pwrSoft=880 pwrHard=1023 impactSoft=1925370 impactHard=3280509 strike=110% rebPwr=800 valid=yes cycleMs=339
+  #9 pitch=64 lagSoft=140 lagHard=106 pwrSoft=760 pwrHard=1023 impactSoft=845016 impactHard=2060388 strike=150% rebPwr=800 valid=yes cycleMs=367ffttest 0
+ffttest mallet=0 hz=180.93 mag=528010.19 midi=54
+cal 1
+Starting full calibration for mallet #1
+Calibrating mallet #1
+    hard: ambient=1836 threshold=4266 rise=826593 minRise=12000 noise=770 lag=60 hit=yes
+    soft: pwr=640 ambient=2270 threshold=4949 rise=477467 minRise=165318 noise=853 lag=60 hit=yes
+    hard: ambient=3164 threshold=9071 rise=911465 minRise=12000 noise=1929 lag=60 hit=yes
+    soft: pwr=640 ambient=1762 threshold=4150 rise=330617 minRise=182293 noise=756 lag=60 hit=yes
+    hard: ambient=1748 threshold=3668 rise=1236940 minRise=12000 noise=600 lag=60 hit=yes
+    soft: pwr=640 ambient=1810 threshold=4432 rise=679896 minRise=247388 noise=834 lag=60 hit=yes
+  velocity: softLag=60 hardLag=60 softImpact=495993 hardImpact=991666 valid=yes
+  pitchHz=174.53 mag=719951.81 detected=53 midi=53
+Saved calibration, writeCount=129, status=ok
+Mallet status:
+  #0 pitch=57 lagSoft=142 lagHard=92 pwrSoft=640 pwrHard=1023 impactSoft=606401 impactHard=876582 strike=130% rebPwr=500 valid=yes cycleMs=307
+  #1 pitch=53 lagSoft=60 lagHard=60 pwrSoft=640 pwrHard=1023 impactSoft=495993 impactHard=991666 strike=170% rebPwr=100 valid=yes cycleMs=246
+  #2 pitch=62 lagSoft=182 lagHard=129 pwrSoft=640 pwrHard=1023 impactSoft=1574523 impactHard=2911788 strike=100% rebPwr=500 valid=yes cycleMs=369
+  #3 pitch=55 lagSoft=175 lagHard=125 pwrSoft=640 pwrHard=1023 impactSoft=1200242 impactHard=1953969 strike=130% rebPwr=500 valid=yes cycleMs=397
+  #4 pitch=60 lagSoft=172 lagHard=122 pwrSoft=640 pwrHard=1023 impactSoft=854549 impactHard=1945504 strike=100% rebPwr=50 valid=yes cycleMs=352
+  #5 pitch=67 lagSoft=131 lagHard=105 pwrSoft=760 pwrHard=1023 impactSoft=2063379 impactHard=3815477 strike=170% rebPwr=650 valid=yes cycleMs=385
+  #6 pitch=72 lagSoft=110 lagHard=63 pwrSoft=760 pwrHard=1023 impactSoft=1026679 impactHard=1550144 strike=170% rebPwr=170 valid=yes cycleMs=255
+  #7 pitch=69 lagSoft=60 lagHard=60 pwrSoft=880 pwrHard=1023 impactSoft=1055979 impactHard=1976445 strike=150% rebPwr=800 valid=yes cycleMs=234
+  #8 pitch=65 lagSoft=129 lagHard=112 pwrSoft=880 pwrHard=1023 impactSoft=1925370 impactHard=3280509 strike=110% rebPwr=800 valid=yes cycleMs=339
+  #9 pitch=64 lagSoft=140 lagHard=106 pwrSoft=760 pwrHard=1023 impactSoft=845016 impactHard=2060388 strike=150% rebPwr=800 valid=yes cycleMs=367
+Full calibration complete for mallet #1
+setnote 1 52
+Saved calibration, writeCount=130, status=ok
+setnote #1 -> 52 (saved=yes)
+calrebound 1
+Tuning rebound for mallet #1
+  pass 1: sweep strike duration (maximize impact)    strike=70% peak=26461 energy=519697    strike=80% peak=23399 energy=589915
+    strike=90% peak=31369 energy=642256
+    strike=100% peak=18751 energy=823063
+    strike=115% peak=89115 energy=2126245
+    strike=130% peak=268942 energy=2266719    strike=150% peak=274738 energy=2315193
+  best strike=150% peak=274738
+  pass 2: sweep rebound power (minimize settle)    pwr=50 peak=150626 energy=1375847    pwr=100 peak=186728 energy=1541798    pwr=170 peak=234228 energy=1933493    pwr=250 peak=622424 energy=2411163    pwr=350 peak=677574 energy=1617487    pwr=500 peak=663865 energy=2591503    pwr=650 peak=561888 energy=4963520    pwr=800 peak=838777 energy=3432927
+  best: strike=150% pwr=50
+Saved calibration, writeCount=131, status=ok
+Mallet status:
+  #0 pitch=57 lagSoft=142 lagHard=92 pwrSoft=640 pwrHard=1023 impactSoft=606401 impactHard=876582 strike=130% rebPwr=500 valid=yes cycleMs=307
+  #1 pitch=52 lagSoft=60 lagHard=60 pwrSoft=640 pwrHard=1023 impactSoft=495993 impactHard=991666 strike=150% rebPwr=50 valid=yes cycleMs=234
+  #2 pitch=62 lagSoft=182 lagHard=129 pwrSoft=640 pwrHard=1023 impactSoft=1574523 impactHard=2911788 strike=100% rebPwr=500 valid=yes cycleMs=369
+  #3 pitch=55 lagSoft=175 lagHard=125 pwrSoft=640 pwrHard=1023 impactSoft=1200242 impactHard=1953969 strike=130% rebPwr=500 valid=yes cycleMs=397
+  #4 pitch=60 lagSoft=172 lagHard=122 pwrSoft=640 pwrHard=1023 impactSoft=854549 impactHard=1945504 strike=100% rebPwr=50 valid=yes cycleMs=352
+  #5 pitch=67 lagSoft=131 lagHard=105 pwrSoft=760 pwrHard=1023 impactSoft=2063379 impactHard=3815477 strike=170% rebPwr=650 valid=yes cycleMs=385
+  #6 pitch=72 lagSoft=110 lagHard=63 pwrSoft=760 pwrHard=1023 impactSoft=1026679 impactHard=1550144 strike=170% rebPwr=170 valid=yes cycleMs=255
+  #7 pitch=69 lagSoft=60 lagHard=60 pwrSoft=880 pwrHard=1023 impactSoft=1055979 impactHard=1976445 strike=150% rebPwr=800 valid=yes cycleMs=234
+  #8 pitch=65 lagSoft=129 lagHard=112 pwrSoft=880 pwrHard=1023 impactSoft=1925370 impactHard=3280509 strike=110% rebPwr=800 valid=yes cycleMs=339
+  #9 pitch=64 lagSoft=140 lagHard=106 pwrSoft=760 pwrHard=1023 impactSoft=845016 impactHard=2060388 strike=150% rebPwr=800 valid=yes cycleMs=367

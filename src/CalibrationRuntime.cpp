@@ -79,7 +79,7 @@ void setCalibrationInProgress(bool active)
 void configureProbeStrike(Mallet &mallet, int strikePower)
 {
   mallet.strikePower = constrain(strikePower, 250, 1023);
-  mallet.strikeDuration = 300;
+  mallet.strikeDuration = 200;
   mallet.coastPower = 0;
   mallet.coastDuration = 1;
   mallet.reboundPower = 0;
@@ -222,15 +222,15 @@ StrikeMeasurement measureStrikeResponse(Mallet &mallet, int32_t thresholdRise, u
     return result;
   }
   const AmbientWindowStats ambientWindow = sampleAmbientWindow(120);
-  const int32_t ambient = ambientWindow.peak;
+  int32_t ambient = ambientWindow.peak;
   int32_t adaptiveRise = thresholdRise;
   const int32_t noiseRise = (ambientWindow.peakToPeak * gDeps.config.impactNoiseMultiplier) + gDeps.config.impactNoiseRiseFloor;
   if (noiseRise > adaptiveRise)
   {
     adaptiveRise = noiseRise;
   }
-  const int32_t triggerThreshold = ambient + adaptiveRise;
-  const int32_t rearmThreshold = triggerThreshold - gDeps.config.impactThresholdHysteresis;
+  int32_t triggerThreshold = ambient + adaptiveRise;
+  int32_t rearmThreshold = triggerThreshold - gDeps.config.impactThresholdHysteresis;
 
   result = {
     maxImpactLagMs,
@@ -243,6 +243,8 @@ StrikeMeasurement measureStrikeResponse(Mallet &mallet, int32_t thresholdRise, u
   };
 
   int32_t detectWindowPeak = ambient;
+  int32_t guardPeakMic = ambient;
+  bool guardPhaseComplete = false;
   const unsigned long startMicros = micros();
   mallet.triggerMallet();
   bool crossedBelowThreshold = (readFilteredMic() <= rearmThreshold);
@@ -251,6 +253,33 @@ StrikeMeasurement measureStrikeResponse(Mallet &mallet, int32_t thresholdRise, u
   {
     const int32_t mic = readFilteredMic();
     const unsigned long elapsedMs = (micros() - startMicros) / 1000UL;
+
+    // Track mic peak during guard phase. Some mallets couple motor
+    // vibration or EMI into the mic, raising the baseline above the
+    // pre-motor ambient. Re-baselining after the guard prevents
+    // false-early detection at the guard boundary.
+    if (elapsedMs < gDeps.config.impactDetectGuardMs)
+    {
+      if (mic > guardPeakMic)
+      {
+        guardPeakMic = mic;
+      }
+    }
+    else if (!guardPhaseComplete)
+    {
+      guardPhaseComplete = true;
+      if (guardPeakMic > ambient)
+      {
+        ambient = guardPeakMic;
+        triggerThreshold = ambient + adaptiveRise;
+        rearmThreshold = triggerThreshold - gDeps.config.impactThresholdHysteresis;
+        detectWindowPeak = ambient;
+        result.ambient = ambient;
+        result.triggerThreshold = triggerThreshold;
+      }
+      crossedBelowThreshold = (mic <= rearmThreshold);
+    }
+
     if (elapsedMs <= maxImpactLagMs && mic > detectWindowPeak)
     {
       detectWindowPeak = mic;
@@ -501,18 +530,18 @@ void runFullCalibrationStepForMallet(size_t index)
 // Strategy: two sequential 1D sweeps (coast then power) rather than a
 // full 2D grid, keeping the trial count manageable (~14 per mallet).
 
-constexpr int kReboundSettleWindowMs = 600;
+constexpr int kReboundSettleWindowMs = 1200;
 constexpr int kReboundInterTrialDelayMs = 150;
 constexpr int kReboundStrikeSteps = 7;
 constexpr int kReboundPowerSteps = 8;
 // Strike duration as % of lag. The rubber ball bounce means the mallet
 // leaves the drum almost immediately, so shorter values release sooner
 // and let braking start earlier.
-constexpr uint8_t kReboundStrikeValues[kReboundStrikeSteps] = {100, 110, 120, 130, 140, 150, 170};
+constexpr uint8_t kReboundStrikeValues[kReboundStrikeSteps] = {70, 90, 110, 130, 160, 200, 250};
 // Peak rebound brake PWM — wider range since elastic bounce preserves
 // much of the strike energy. Heavier mallets may need 600+ to brake.
-constexpr uint16_t kReboundPowerValues[kReboundPowerSteps] = {50, 100, 170, 250, 350, 500, 650, 800};
-constexpr uint8_t kReboundDefaultStrikePct = 150;
+constexpr uint16_t kReboundPowerValues[kReboundPowerSteps] = {0, 50, 100, 170, 250, 400, 600, 800};
+constexpr uint8_t kReboundDefaultStrikePct = 100;
 constexpr uint16_t kReboundDefaultPower = 250;
 
 unsigned long totalProfileDuration(const Mallet::StrikeProfile &profile)
@@ -538,7 +567,7 @@ Mallet::StrikeProfile buildReboundTestProfile(
   const float lagF = static_cast<float>(model.hardLagMs);
 
   const int totalStrikeDur = constrain(static_cast<int>(lagF * static_cast<float>(strikePct) / 100.0f), 30, 600);
-  const int totalReboundDur = constrain(static_cast<int>(lagF * 1.4f), 30, 400);
+  const int totalReboundDur = constrain(static_cast<int>(lagF * 2.5f), 200, 600);
   const int clampedRebPwr = constrain(static_cast<int>(reboundPwr), 0, 1023);
 
   Mallet::StrikeProfile prof = {};

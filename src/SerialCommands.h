@@ -21,6 +21,8 @@ struct Handlers
   void (*setMicModeFromCommand)(const String &cmd);
   void (*runFftTestForMallet)(int index);
   void (*setMalletMidiFromCommand)(const String &cmd);
+  void (*setMalletStrikeFromCommand)(const String &cmd);
+  void (*setMalletReboundFromCommand)(const String &cmd);
   void (*printLoopStats)();
   void (*runReboundCalibration)();
   void (*runReboundCalibrationForMallet)(size_t index);

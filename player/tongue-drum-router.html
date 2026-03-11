@@ -152,6 +152,15 @@
       </div>
     </div>
 
+    <!-- VELOCITY -->
+    <div>
+      <label class="label">Velocity</label>
+      <div style="display:flex;align-items:center;gap:12px">
+        <input type="range" id="velocitySlider" min="10" max="150" value="100" style="flex:1;-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:var(--border);cursor:pointer">
+        <span id="velocityDisplay" style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--accent);min-width:40px">100%</span>
+      </div>
+    </div>
+
     <!-- TIMING -->
     <div class="panel">
       <label class="label">Mallet Constraints</label>
@@ -212,7 +221,7 @@ const NOTES = [
   { midi: 65, name: "F4", cycle: 329 }, { midi: 67, name: "G4", cycle: 246 },
   { midi: 69, name: "A4", cycle: 384 }, { midi: 72, name: "C5", cycle: 261 },
 ];
-const PADDING = 1.2;
+const PADDING = 0.8;
 const VALID = new Set(NOTES.map(n => n.midi));
 const CYCLE = {}, PNAME = {}, PIDX = {};
 NOTES.forEach((n, i) => { CYCLE[n.midi] = Math.ceil(n.cycle * PADDING); PNAME[n.midi] = n.name; PIDX[n.midi] = i; });
@@ -231,14 +240,55 @@ let S = {
   cmdResponseBuf: "", cmdResponseTimer: null,
 };
 
+// ─── BLE write queue ─────────────────────────────────────────
+// Serializes BLE writes so a note-off in flight can't cause a
+// subsequent note-on group write to fail silently.
+let bleWriteQueue = [];
+let bleWriting = false;
+async function queueBleWrite(packet) {
+  bleWriteQueue.push(packet);
+  if (bleWriting) return;
+  bleWriting = true;
+  while (bleWriteQueue.length > 0) {
+    const data = bleWriteQueue.shift();
+    if (S.bleChar) {
+      try { await S.bleChar.writeValueWithoutResponse(new Uint8Array(data)); }
+      catch (e) { console.warn("BLE write failed:", e); }
+    }
+  }
+  bleWriting = false;
+}
+
 // ─── MIDI Output ─────────────────────────────────────────────
+function bleMidiPacket(messages) {
+  const ts = performance.now() & 0x1fff;
+  const packet = [0x80 | ((ts >> 7) & 0x3f)];
+  const tsLow = 0x80 | (ts & 0x7f);
+  for (const msg of messages) packet.push(tsLow, ...msg);
+  return packet;
+}
+
+function scaleVelocity(v) {
+  return Math.max(1, Math.min(127, Math.round(v * (+document.getElementById("velocitySlider").value) / 100)));
+}
+
 function sendNoteOn(p, v) {
+  v = scaleVelocity(v);
   if (S.selectedMidiId && S.midiAccess) { const port = S.midiAccess.outputs.get(S.selectedMidiId); if (port) port.send([0x90, p, v]); }
-  if (S.bleChar) { const ts = performance.now() & 0x1fff; S.bleChar.writeValueWithoutResponse(new Uint8Array([0x80|((ts>>7)&0x3f), 0x80|(ts&0x7f), 0x90, p, v])).catch(()=>{}); }
+  if (S.bleChar) queueBleWrite(bleMidiPacket([[0x90, p, v]]));
 }
 function sendNoteOff(p) {
   if (S.selectedMidiId && S.midiAccess) { const port = S.midiAccess.outputs.get(S.selectedMidiId); if (port) port.send([0x80, p, 0]); }
-  if (S.bleChar) { const ts = performance.now() & 0x1fff; S.bleChar.writeValueWithoutResponse(new Uint8Array([0x80|((ts>>7)&0x3f), 0x80|(ts&0x7f), 0x80, p, 0])).catch(()=>{}); }
+  if (S.bleChar) queueBleWrite(bleMidiPacket([[0x80, p, 0]]));
+}
+// Send multiple note-ons in a single BLE MIDI packet so simultaneous notes
+// from different tracks don't overwhelm the BLE connection with rapid writes.
+function sendNoteOnGroup(notes) {
+  if (S.selectedMidiId && S.midiAccess) {
+    const port = S.midiAccess.outputs.get(S.selectedMidiId);
+    if (port) for (const [p, v] of notes) port.send([0x90, p, v]);
+  }
+  if (S.bleChar) queueBleWrite(bleMidiPacket(notes.map(([p, v]) => [0x90, p, scaleVelocity(v)])));
 }
 function hasMidiOut() { return !!(S.selectedMidiId || S.bleChar); }
 
@@ -308,6 +358,7 @@ function renderBLE() {
         S.bleDevice = d; S.bleStatus = "connected";
       } catch(e) { console.error("BLE:", e); S.bleStatus = "disconnected"; }
       renderBLE(); updateWarning(); renderControlPanel();
+      if (S.cmdChar) setTimeout(() => sendCommand("status"), 200);
     });
   }
 }
@@ -345,8 +396,8 @@ function parseStatusResponse(text) {
   const mallets = [];
   const lines = text.split("\n");
   for (const line of lines) {
-    const m = line.match(/#(\d+)\s+pitch=(\d+)\s+lagSoft=(\d+)\s+lagHard=(\d+)\s+pwrSoft=(\d+)\s+pwrHard=(\d+).*?valid=(\w+)(?:\s+cycleMs=(\d+))?/);
-    if (m) mallets.push({ idx: +m[1], pitch: +m[2], lagSoft: +m[3], lagHard: +m[4], pwrSoft: +m[5], pwrHard: +m[6], valid: m[7]==="yes", cycleMs: m[8] ? +m[8] : null });
+    const m = line.match(/#(\d+)\s+pitch=(\d+)\s+lagSoft=(\d+)\s+lagHard=(\d+)\s+pwrSoft=(\d+)\s+pwrHard=(\d+)\s+impactSoft=(\d+)\s+impactHard=(\d+)\s+strike=(\d+)%\s+rebPwr=(\d+)\s+valid=(\w+)(?:\s+cycleMs=(\d+))?/);
+    if (m) mallets.push({ idx: +m[1], pitch: +m[2], lagSoft: +m[3], lagHard: +m[4], pwrSoft: +m[5], pwrHard: +m[6], impactSoft: +m[7], impactHard: +m[8], strikePct: +m[9], reboundPwr: +m[10], valid: m[11]==="yes", cycleMs: m[12] ? +m[12] : null });
   }
   if (mallets.length > 0) {
     S.malletStatus = mallets;
@@ -360,12 +411,38 @@ function renderMalletStatus() {
   el.innerHTML = S.malletStatus.map(m => {
     const name = PNAME[m.pitch] || ("M" + m.pitch);
     const col = PCOL[m.pitch] || "var(--text-muted)";
-    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border)">
-      <span style="color:${col};font-weight:600">#${m.idx} ${name}</span>
-      <span style="color:var(--text-dim)">${m.lagHard}-${m.lagSoft}ms ${m.cycleMs ? m.cycleMs+'ms' : ''}</span>
-      <span style="color:${m.valid?'var(--success)':'var(--error)'}">${m.valid?'OK':'--'}</span>
+    return `<div style="padding:5px 0;border-bottom:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+        <span style="color:${col};font-weight:600">#${m.idx} ${name}</span>
+        <span style="color:var(--text-dim)">${m.lagHard}-${m.lagSoft}ms</span>
+        <span style="color:${m.valid?'var(--success)':'var(--error)'}">${m.valid?'OK':'--'}</span>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <label style="font-size:10px;color:var(--text-dim);width:42px">str ${m.strikePct}%</label>
+        <input type="range" min="50" max="250" step="5" value="${m.strikePct}" data-idx="${m.idx}" data-param="strike"
+          style="flex:1;height:3px;-webkit-appearance:none;appearance:none;background:var(--border);border-radius:2px;cursor:pointer">
+        <label style="font-size:10px;color:var(--text-dim);width:42px">reb ${m.reboundPwr}</label>
+        <input type="range" min="0" max="800" step="25" value="${m.reboundPwr}" data-idx="${m.idx}" data-param="rebound"
+          style="flex:1;height:3px;-webkit-appearance:none;appearance:none;background:var(--border);border-radius:2px;cursor:pointer">
+      </div>
     </div>`;
   }).join("");
+  // Wire up slider events
+  el.querySelectorAll("input[type=range]").forEach(slider => {
+    let debounce = 0;
+    slider.addEventListener("input", () => {
+      const label = slider.previousElementSibling;
+      if (slider.dataset.param === "strike") label.textContent = `str ${slider.value}%`;
+      else label.textContent = `reb ${slider.value}`;
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        const cmd = slider.dataset.param === "strike"
+          ? `setstrike ${slider.dataset.idx} ${slider.value}`
+          : `setrebound ${slider.dataset.idx} ${slider.value}`;
+        sendCommand(cmd);
+      }, 300);
+    });
+  });
 }
 
 function renderControlPanel() {
@@ -398,6 +475,10 @@ function renderControlPanel() {
   document.getElementById("cmdInput")?.addEventListener("keydown", e => {
     if (e.key === "Enter") { document.getElementById("cmdSend")?.click(); }
   });
+  // Always render mallet sliders — use defaults if no status data yet
+  if (!S.malletStatus) {
+    S.malletStatus = NOTES.map((n, i) => ({ idx: i, pitch: n.midi, lagSoft: 0, lagHard: 0, strikePct: 150, reboundPwr: 250, valid: false, cycleMs: null }));
+  }
   renderMalletStatus();
 }
 
@@ -689,19 +770,31 @@ async function play() {
   const preRollMs = useMidi ? MIDI_LEAD_MS : 0;
   const start = performance.now();
 
-  for (const [pitch, beat, dur, vel] of c.notes) {
-    const ms = beat * spb * 1000;
-    const durSec = dur * spb;
-    if (useSpeaker) {
-      S.timeouts.push(setTimeout(() => {
-        try { S.synth.triggerAttackRelease(Tone.Frequency(pitch,"midi").toFrequency(), durSec, undefined, vel/127); } catch {}
-      }, ms + preRollMs));
+  // Group notes by scheduled time so simultaneous notes (e.g. from
+  // different MIDI tracks) are sent as a single BLE packet instead of
+  // rapid-fire individual writes that can overwhelm the BLE connection.
+  if (useMidi) {
+    const noteOnsByMs = new Map();
+    for (const [pitch, beat, dur, vel] of c.notes) {
+      const ms = Math.round(beat * spb * 1000);
+      if (!noteOnsByMs.has(ms)) noteOnsByMs.set(ms, []);
+      noteOnsByMs.get(ms).push([pitch, vel]);
     }
-    if (useMidi) {
-      // Send MIDI at the natural time. The ESP32 buffers each note by
-      // MIDI_LEAD_MS and uses that runway for lag compensation.
-      S.timeouts.push(setTimeout(() => sendNoteOn(pitch, vel), ms));
-      S.timeouts.push(setTimeout(() => sendNoteOff(pitch), ms + durSec * 1000));
+    for (const [ms, group] of noteOnsByMs) {
+      S.timeouts.push(setTimeout(() => sendNoteOnGroup(group), ms));
+    }
+    for (const [pitch, beat, dur] of c.notes) {
+      const ms = beat * spb * 1000;
+      S.timeouts.push(setTimeout(() => sendNoteOff(pitch), ms + dur * spb * 1000));
+    }
+  }
+  if (useSpeaker) {
+    for (const [pitch, beat, dur, vel] of c.notes) {
+      const ms = beat * spb * 1000;
+      const durSec = dur * spb;
+      S.timeouts.push(setTimeout(() => {
+        try { S.synth.triggerAttackRelease(Tone.Frequency(pitch,"midi").toFrequency(), durSec, undefined, scaleVelocity(vel)/127); } catch {}
+      }, ms + preRollMs));
     }
   }
   S.timeouts.push(setTimeout(stopPlayback, totalMs + preRollMs + 300));
@@ -776,6 +869,12 @@ document.addEventListener("DOMContentLoaded", () => {
     updateTimingGrid(+tsl.value);
     clearTimeout(tempoDebounce);
     tempoDebounce = setTimeout(() => { if (S.composition) { reapplyConstraints(); showComposition(); } }, 150);
+  });
+
+  // Velocity
+  const vsl = document.getElementById("velocitySlider");
+  vsl.addEventListener("input", () => {
+    document.getElementById("velocityDisplay").textContent = vsl.value + "%";
   });
 
   // Buttons
