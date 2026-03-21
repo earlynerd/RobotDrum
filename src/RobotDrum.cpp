@@ -93,7 +93,7 @@ enum MicSampleMode
 };
 
 Mallet mallets[] = {
-  Mallet(15, 52, 0, 900, 110, 0, 50, 512, 50),
+  Mallet(14, 52, 0, 900, 110, 0, 50, 512, 50),
   Mallet(4, 55, 1, 900, 110, 0, 50, 512, 50),
   Mallet(12, 57, 2, 900, 110, 0, 50, 512, 50),
   Mallet(32, 60, 3, 900, 110, 0, 50, 512, 50),
@@ -1711,6 +1711,10 @@ void handleNoteOff(uint8_t channel, uint8_t note, uint8_t velocity, uint16_t tim
 
 void setup()
 {
+  for (size_t i = 0; i < kMalletCount; ++i)
+  {
+    mallets[i].begin();
+  }
   Serial.begin(115200);
   const unsigned long serialWaitStart = millis();
   while (!Serial && (millis() - serialWaitStart < 2000))
@@ -1719,10 +1723,7 @@ void setup()
   }
 
   EEPROM.begin(kEepromBytes);
-  for (size_t i = 0; i < kMalletCount; ++i)
-  {
-    mallets[i].begin();
-  }
+  
   initializeVelocityCalibrationDefaults();
   setupAudioCapture();
 
